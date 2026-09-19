@@ -164,15 +164,23 @@ A hand-crafted geometric baseline — no model training, consistent with the pro
    distance from its fingertip + wrist landmarks to the head center, normalized by
    `head_scale`. A value ≲ 1.0 means a hand landmark has entered the head disk. This is
    scale-invariant (robust to the subject moving closer/further from the camera).
-4. **Event extraction.** A small debounce state machine turns the noisy per-frame signal
-   into discrete events: a few consecutive below-threshold frames confirm a touch start,
-   a few consecutive above-threshold frames confirm the end (so single-frame landmark
+4. **Speed gate.** A frame only counts as touching if the hand is close **and slow**. A
+   real touch decelerates to a near standstill at the head; a gesture or hair-flick
+   passes through the close zone at speed. Speed is the **wrist's** pixel speed
+   (a stable anchor — the "closest fingertip" used for distance can flip between fingers
+   and fake motion), normalized by `head_scale` to head-widths/sec and smoothed over 3
+   frames. Gaps in hand detection longer than 0.25 s make speed "unknown" (not slow).
+5. **Event extraction.** A small debounce state machine turns the noisy per-frame signal
+   into discrete events: a few consecutive close-and-slow frames confirm a touch start
+   (so `--enter-frames` doubles as the dwell-time requirement),
+   a few consecutive frames failing the gate confirm the end (so single-frame landmark
    jitter can't fabricate an event), and a frame where the hand briefly isn't detected
    *while already touching* is treated as still-touching rather than an automatic end
    (self-occlusion from the hand covering the head is expected exactly then).
    `contact_time` is reported as the frame of minimum normalized distance within the
-   event.
-5. **Evaluation.** Detected events are matched to ground-truth events by nearest
+   first 1.5 s of the event (bounded because a hand lingering near the head can keep one
+   event open for many seconds, and a global minimum could then pick an unrelated later dip).
+6. **Evaluation.** Detected events are matched to ground-truth events by nearest
    `contact_time`, one-to-one, within a **±0.5 s** tolerance window — generous enough to
    absorb landmark noise while still meaning something, chosen against a ground truth of
    only 3 events. Hand label (left/right) is reported per match as a diagnostic but does
@@ -195,52 +203,57 @@ A hand-crafted geometric baseline — no model training, consistent with the pro
     outputs\detected_events.csv --tolerance 0.5
 ```
 
-`--threshold`, `--enter-frames`, and `--exit-frames` on `head_touch_detector.py` control
-the state machine; defaults (`1.15`, `3`, `5`) were picked as reasonable starting points
-and can be retuned by re-running `evaluate.py` against different `--threshold` values
-without re-running the (expensive) landmark extraction, since `--signal-csv` caches the
-raw per-frame distances.
+`--threshold`, `--velocity-threshold`, `--enter-frames`, and `--exit-frames` on
+`head_touch_detector.py` control the gate and state machine; the defaults
+(`1.0`, `0.5`, `3`, `10`) came from `src/tune_threshold.py`. Because `--signal-csv`
+caches the raw per-frame distances and wrist positions, retuning never needs the
+(expensive) landmark extraction again:
+
+```powershell
+.venv\Scripts\python.exe src\tune_threshold.py outputs\distance_signal.csv `
+    annotations\test_video_task_annotations.csv
+.venv\Scripts\python.exe src\head_touch_detector.py data\test_video_task.mp4 `
+    outputs\detected_events.csv --from-signal outputs\distance_signal.csv
+```
 
 ### Results
 
 Run against `data/test_video_task.mp4` (5:12, 9,349 frames) with the tuned defaults
-(`--threshold 1.0 --enter-frames 5 --exit-frames 10`, picked via `src/tune_threshold.py`
-grid-searching against ground truth — see that script's docstring):
+(`--threshold 1.0 --velocity-threshold 0.5 --enter-frames 3 --exit-frames 10`, picked via
+`src/tune_threshold.py` grid-searching against ground truth):
 
-| Metric | Value |
-|---|---|
-| Ground-truth events | 3 |
-| Detected events | 24 |
-| True positives | 3 |
-| False negatives (missed) | 0 |
-| False positives (extra) | 21 |
-| **Recall** | **1.00** |
-| **Precision** | **0.12** |
-| F1 | 0.22 |
-| Mean timing error on matches | 0.20 s |
+| Metric | Distance only | + speed gate (current) |
+|---|---|---|
+| Ground-truth events | 3 | 3 |
+| Detected events | 24 | 11 |
+| True positives | 3 | 3 |
+| False negatives (missed) | 0 | 0 |
+| False positives (extra) | 21 | 8 |
+| **Recall** | **1.00** | **1.00** |
+| **Precision** | 0.12 | **0.27** |
+| F1 | 0.22 | 0.43 |
+| Mean timing error on matches | 0.20 s | 0.26 s |
 
-All 3 real head-touches are found, and their detected `contact_time` lands within
-0.03–0.30 s of the manually annotated moment — well inside the ±0.5 s tolerance. The
-tradeoff is precision: at a threshold loose enough to catch every real touch, the
-detector also fires on ~21 other moments where a hand passes close to the head without
-actually touching it (adjusting hair, gesturing near the face, resting a hand near the
-ear/chin while thinking, etc.) — plausible given the head-as-a-circle model only knows
-*distance*, not *contact*. A few of the false positives have a very small
-`min_normalized_distance` (e.g. 0.01–0.14) and are plausibly genuine brief contacts (hair,
-ear, chin) that weren't logged as "head touches" during annotation — a labeling-scope
-question as much as a detector error.
+All 3 real head-touches are found, with `contact_time` within 0.03–0.46 s of the
+annotated moment (inside the ±0.5 s tolerance, though one match sits near its edge). The
+speed gate cut false positives from 21 to 8 without losing a real touch; the 0.5
+head-widths/sec setting held across neighbouring enter/exit values rather than being a
+one-off spike. Precision is still low: the remaining detections are moments where a hand
+slows down near the head without an annotated touch (adjusting hair, resting a hand near
+the ear/chin, etc.), which the head-as-a-circle model can't tell apart from a real
+touch. Some have a very small `min_normalized_distance` and are plausibly genuine brief
+contacts that weren't logged as "head touches" — a labeling-scope question as much as a
+detector error.
 
 **Why recall was favored over precision:** for a system meant to *find* head-touch
 events, missing a real one is worse than flagging an extra candidate a human can quickly
-rule out — so parameter tuning optimized for catching all 3 ground-truth events first,
-then minimized false positives at that recall level. `src/tune_threshold.py` makes this
-tradeoff explicit and re-tunable.
+rule out.
 
-**Known limitation & natural next step:** distance alone can't distinguish "hand stops
-and touches" from "hand passes near and keeps moving." The signal already has what's
-needed to fix this without any ML training — hand velocity/deceleration near the head,
-and dwell time at minimum distance — as an additional filter on top of the existing
-proximity events. That's the next thing to try before reaching for a trained classifier.
+**Caveat — small-sample tuning.** Both thresholds were tuned against only 3 events from
+one person in one camera setup, so treat 0.27 precision as an in-sample number, not a
+generalization estimate. Validating on other people, cameras and lighting is the real
+next step, and it is what would decide whether a light trained classifier over these same
+features (distance, speed, dwell) is worth adding.
 
 ## Design decisions
 

@@ -24,7 +24,12 @@ Method (see README for the full write-up):
    head_scale. A normalized distance <= ~1.0 means a hand landmark has
    entered the head disk.
 
-4. Turn that per-frame signal into discrete events with a small debounce
+4. Gate on speed as well as distance: a frame only counts as touching if
+   the wrist is also moving slowly (a real touch decelerates to a near
+   standstill at the head; a gesture passes through at speed). Velocity
+   is wrist speed in head-widths/sec, see `add_velocities`.
+
+5. Turn that per-frame signal into discrete events with a small debounce
    state machine (see `extract_events`): a few consecutive frames must
    cross the threshold before a touch is confirmed as starting or ending,
    so single-frame landmark jitter doesn't fabricate events. A frame where
@@ -66,7 +71,15 @@ VISIBILITY_THRESHOLD = 0.5
 HAND_CONTACT_LANDMARK_IDS = [0, 4, 8, 12, 16, 20]  # wrist + 5 fingertips
 
 EVENTS_CSV_HEADER = ["event_id", "start_time", "contact_time", "end_time", "hand", "notes"]
-SIGNAL_CSV_HEADER = ["frame", "time_sec", "hand", "normalized_distance", "head_scale_px", "head_source"]
+SIGNAL_CSV_HEADER = ["frame", "time_sec", "hand", "normalized_distance", "head_scale_px", "head_source",
+                     "wrist_x", "wrist_y"]
+
+WRIST_ID = 0
+# Velocity is only trusted across short gaps in hand detection; a longer gap
+# means the hand was lost and re-found, so the "speed" between the two
+# observations isn't meaningful and is treated as unknown (i.e. not slow).
+MAX_VELOCITY_GAP_SEC = 0.25
+VELOCITY_SMOOTHING_ROWS = 3
 
 
 def _dist(a, b):
@@ -170,6 +183,7 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
                             _dist(_to_px(hand_landmarks[i], width, height), center)
                             for i in HAND_CONTACT_LANDMARK_IDS
                         )
+                        wrist_x, wrist_y = _to_px(hand_landmarks[WRIST_ID], width, height)
                         yield {
                             "frame": frame_idx,
                             "time_sec": frame_idx / fps,
@@ -177,6 +191,8 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
                             "normalized_distance": min_px_dist / scale,
                             "head_scale_px": scale,
                             "head_source": source,
+                            "wrist_x": wrist_x,
+                            "wrist_y": wrist_y,
                         }
             frame_idx += 1
     finally:
@@ -185,8 +201,34 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
         pose_landmarker.close()
 
 
+def add_velocities(rows) -> None:
+    """Annotate time-sorted rows of ONE hand with a `velocity` key, in
+    head-widths per second (wrist speed / head_scale_px).
+
+    The wrist is used as the anchor rather than the closest-of-several
+    contact landmarks used for distance, because that "closest" landmark
+    can flip between fingertips frame to frame and fake motion on a hand
+    that is actually still. Step speeds are smoothed over a short trailing
+    window since single-frame landmark jitter is comparable to real slow
+    motion. A row with no usable predecessor (first row, or a gap longer
+    than MAX_VELOCITY_GAP_SEC) gets `inf`, i.e. never counts as slow.
+    """
+    step_speeds = []
+    for i, row in enumerate(rows):
+        speed = float("inf")
+        if i > 0:
+            prev = rows[i - 1]
+            dt = row["time_sec"] - prev["time_sec"]
+            if 0 < dt <= MAX_VELOCITY_GAP_SEC:
+                px = _dist((row["wrist_x"], row["wrist_y"]), (prev["wrist_x"], prev["wrist_y"]))
+                speed = px / dt / row["head_scale_px"]
+        step_speeds.append(speed)
+        window = step_speeds[-VELOCITY_SMOOTHING_ROWS:]
+        row["velocity"] = sum(window) / len(window)
+
+
 def extract_events(signal_rows, threshold: float, enter_frames: int, exit_frames: int,
-                    contact_window_seconds: float = 1.5):
+                    contact_window_seconds: float = 1.5, velocity_threshold: float = None):
     """State machine per hand label -> list of event dicts with keys
     start_time, contact_time, end_time, hand (all in seconds), plus
     min_normalized_distance for diagnostics.
@@ -202,6 +244,13 @@ def extract_events(signal_rows, threshold: float, enter_frames: int, exit_frames
     under ~1.5s from start to end, so that's the default search window;
     `end_time` (and the exit debounce that produces it) is unaffected and
     can still extend well past it.
+
+    `velocity_threshold` (head-widths/sec, None = off) adds a second gate:
+    a frame only counts as "touching" if the hand is close AND slow. A real
+    touch decelerates to near-standstill at the head, while a gesture or
+    hair-flick passes through the close zone at speed. Because the gate
+    feeds the same enter/exit debounce, `enter_frames` doubles as the
+    dwell-time requirement.
     """
     by_hand = {}
     for row in signal_rows:
@@ -210,6 +259,8 @@ def extract_events(signal_rows, threshold: float, enter_frames: int, exit_frames
     events = []
     for hand_label, rows in by_hand.items():
         rows.sort(key=lambda r: r["frame"])
+        if velocity_threshold is not None:
+            add_velocities(rows)
         state = "idle"
         consecutive_below = 0
         consecutive_above = 0
@@ -218,6 +269,8 @@ def extract_events(signal_rows, threshold: float, enter_frames: int, exit_frames
 
         for idx, row in enumerate(rows):
             below = row["normalized_distance"] <= threshold
+            if velocity_threshold is not None:
+                below = below and row["velocity"] <= velocity_threshold
 
             if state == "idle":
                 consecutive_below = consecutive_below + 1 if below else 0
@@ -240,7 +293,9 @@ def extract_events(signal_rows, threshold: float, enter_frames: int, exit_frames
                         "hand": hand_label,
                         "start_time": start_row["time_sec"],
                         "contact_time": best_row["time_sec"],
-                        "end_time": end_row["time_sec"],
+                        # Back-dating the end by exit_frames can land before the
+                        # contact frame on short events; an event can't end before it touches.
+                        "end_time": max(end_row["time_sec"], best_row["time_sec"]),
                         "min_normalized_distance": best_row["normalized_distance"],
                     })
                     state = "idle"
@@ -271,6 +326,7 @@ def write_signal_csv(path: str, rows) -> None:
             writer.writerow([
                 row["frame"], f"{row['time_sec']:.3f}", row["hand"],
                 f"{row['normalized_distance']:.4f}", f"{row['head_scale_px']:.2f}", row["head_source"],
+                f"{row['wrist_x']:.2f}", f"{row['wrist_y']:.2f}",
             ])
 
 
@@ -289,6 +345,8 @@ def load_signal_csv(path: str):
                 "normalized_distance": float(row["normalized_distance"]),
                 "head_scale_px": float(row["head_scale_px"]),
                 "head_source": row["head_source"],
+                "wrist_x": float(row["wrist_x"]),
+                "wrist_y": float(row["wrist_y"]),
             })
     return rows
 
@@ -317,12 +375,15 @@ def main():
                               "previously-written --signal-csv (fast; for tuning thresholds)")
     parser.add_argument("--threshold", type=float, default=1.0,
                          help="Normalized distance below which a hand counts as touching the head")
-    parser.add_argument("--enter-frames", type=int, default=5,
+    parser.add_argument("--enter-frames", type=int, default=3,
                          help="Consecutive below-threshold frames required to confirm touch start")
     parser.add_argument("--exit-frames", type=int, default=10,
                          help="Consecutive above-threshold frames required to confirm touch end")
     parser.add_argument("--contact-window", type=float, default=1.5,
                          help="Seconds after touch start to search for the contact (min-distance) frame")
+    parser.add_argument("--velocity-threshold", type=float, default=0.5,
+                         help="Max wrist speed (head-widths/sec) for a frame to count as touching; "
+                              "omit to disable the velocity gate")
     parser.add_argument("--max-hands", type=int, default=2)
     args = parser.parse_args()
 
@@ -339,7 +400,8 @@ def main():
         print(f"Wrote raw distance signal to {args.signal_csv}")
 
     events = extract_events(signal_rows, args.threshold, args.enter_frames, args.exit_frames,
-                             contact_window_seconds=args.contact_window)
+                             contact_window_seconds=args.contact_window,
+                             velocity_threshold=args.velocity_threshold)
     write_events_csv(args.events_csv, events)
     print(f"Detected {len(events)} event(s), written to {args.events_csv}")
     for e in events:
