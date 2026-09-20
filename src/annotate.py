@@ -5,6 +5,7 @@ Lets you scrub through a video frame-by-frame and log head-touch events
 
 Usage:
     python src/annotate.py data/test_video.mp4 annotations/test_video_annotations.csv
+    python src/annotate.py data/test_video.mp4 annotations/test_video_annotations.csv --start 02:30.00
 
 Controls (video window must be focused):
     space       play / pause
@@ -25,7 +26,7 @@ import os
 
 import cv2
 
-from timeutils import format_timestamp
+from timeutils import format_timestamp, parse_timestamp
 
 CSV_HEADER = ["event_id", "start_time", "contact_time", "end_time", "hand", "notes"]
 
@@ -52,6 +53,8 @@ def main():
     parser = argparse.ArgumentParser(description="Interactive head-touch ground-truth annotator.")
     parser.add_argument("video", help="Path to the input video file")
     parser.add_argument("csv", help="Path to the annotations CSV to append to")
+    parser.add_argument("--start", default="00:00.00",
+                        help="Timestamp (MM:SS.ss) to open the video at, e.g. 02:30.00")
     args = parser.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -69,7 +72,7 @@ def main():
     print(f"Loaded {args.video}: {frame_count} frames @ {fps:.2f} fps")
     print(f"Appending to {args.csv} (next event_id = {next_event_id})\n")
 
-    current_frame = 0
+    current_frame = int(parse_timestamp(args.start) * fps)
     playing = False
     pending_start = None
     pending_contact = None

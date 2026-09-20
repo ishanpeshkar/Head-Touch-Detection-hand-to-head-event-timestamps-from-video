@@ -9,7 +9,7 @@ baseline (no ML training) before considering anything more complex.
 ## Development phases
 
 1. **Data Collection / Video Understanding** — done (this document)
-2. **Ground Truth / Annotation** — done, 3 events annotated in `test_video_task_annotations.csv`
+2. **Ground Truth / Annotation** — done, 4 events annotated in `test_video_task_annotations.csv`
 3. **Core Detection** — done (MediaPipe hand + pose landmarks, normalized spatial distance)
 4. **Event Detection + Timestamping** — done (debounced threshold state machine, evaluated against ground truth)
 
@@ -43,7 +43,7 @@ Hand-movement-detection-proj/
 ├── models/                   # MediaPipe .task model bundles, gitignored (run download_models.py)
 ├── annotations/
 │   ├── annotation_format_example.csv   # format reference, not real data
-│   └── test_video_task_annotations.csv # real ground truth (3 events)
+│   └── test_video_task_annotations.csv # real ground truth (4 events)
 ├── outputs/                  # generated artifacts (sample frames, detected events, etc.), gitignored
 ├── .venv/                    # local virtual environment, gitignored
 ├── requirements.txt
@@ -130,6 +130,8 @@ log events without hand-timing anything in a separate player.
 
 ```powershell
 .venv\Scripts\python.exe src\annotate.py data\test_video_task.mp4 annotations\test_video_task_annotations.csv
+# open near a known moment instead of scrubbing from the start:
+.venv\Scripts\python.exe src\annotate.py data\test_video_task.mp4 annotations\test_video_task_annotations.csv --start 02:30.00
 ```
 
 Controls:
@@ -196,7 +198,7 @@ A hand-crafted geometric baseline — no model training, consistent with the pro
 6. **Evaluation.** Detected events are matched to ground-truth events by nearest
    `contact_time`, one-to-one, within a **±0.5 s** tolerance window — generous enough to
    absorb landmark noise while still meaning something, chosen against a ground truth of
-   only 3 events. Hand label (left/right) is reported per match as a diagnostic but does
+   only 3-4 events. Hand label (left/right) is reported per match as a diagnostic but does
    **not** gate the match, since MediaPipe's handedness convention can come out mirrored
    relative to the real-world hand depending on how the source video was captured.
 
@@ -235,39 +237,53 @@ Run against `data/test_video_task.mp4` (5:12, 9,349 frames) with the tuned defau
 (`--threshold 1.0 --velocity-threshold 0.5 --enter-frames 3 --exit-frames 10`, picked via
 `src/tune_threshold.py` grid-searching against ground truth):
 
-| Metric | Distance only | + speed gate (current) |
-|---|---|---|
-| Ground-truth events | 3 | 3 |
-| Detected events | 24 | 11 |
-| True positives | 3 | 3 |
-| False negatives (missed) | 0 | 0 |
-| False positives (extra) | 21 | 8 |
-| **Recall** | **1.00** | **1.00** |
-| **Precision** | 0.12 | **0.27** |
-| F1 | 0.22 | 0.43 |
-| Mean timing error on matches | 0.20 s | 0.26 s |
+**Ground truth: 4 annotated touches.** The original annotation had 3. During the
+false-positive review (below) a fourth touch (right hand flat on the forehead, annotated
+02:34.03 / 02:34.90 / 02:36.10) turned out to have been missed by the annotator and was
+added afterwards. **The thresholds were tuned before it was added, on the original 3
+events, and were not re-tuned.**
 
-All 3 real head-touches are found, with `contact_time` within 0.03–0.46 s of the
-annotated moment (inside the ±0.5 s tolerance, though one match sits near its edge). The
-speed gate cut false positives from 21 to 8 without losing a real touch; the 0.5
+Two matching rules are reported. The **strict** rule is the headline: a detection matches
+if its `contact_time` is within ±0.5 s of the annotated `contact_time`. The **overlap**
+rule additionally accepts a detection whose `[start, end]` interval overlaps the annotated
+one. It was added *after* seeing that the strict rule scores the fourth touch as a miss,
+so treat it as a secondary, more lenient number, not a replacement.
+
+| Metric (4 annotated touches) | Distance only, strict | Speed gate, **strict** | Speed gate, overlap |
+|---|---|---|---|
+| Detected events | 24 | 11 | 11 |
+| True positives | 3 | 3 | 4 |
+| False negatives (missed) | 1 | 1 | 0 |
+| False positives (extra) | 21 | 8 | 7 |
+| **Recall** | 0.75 | **0.75** | 1.00 |
+| **Precision** | 0.12 | **0.27** | 0.36 |
+| F1 | 0.21 | 0.40 | 0.53 |
+| Mean timing error on matches | 0.20 s | 0.26 s | 0.42 s |
+
+(Distance only with overlap matching: precision 0.17, recall 1.00.)
+
+The fourth touch is *detected* (detection #5) but scores as a miss under the strict rule.
+The hand lands at about 02:34.9 and stays on the forehead until about 02:36.1. The annotation marks the
+landing, while the detector's `contact_time` is the frame where the hand is *closest*, which
+here is 02:35.80, 0.90 s later. The same lag shows in two of the other three touches
+(+0.30 s and +0.46 s; the third is +0.03 s). The speed gate still cut false positives from
+21 to 8 without losing any touch the distance-only version found; the 0.5
 head-widths/sec setting held across neighbouring enter/exit values rather than being a
-one-off spike. Precision is still low: the remaining detections are moments where a hand
-slows down near the head without an annotated touch (adjusting hair, resting a hand near
-the ear/chin, etc.), which the head-as-a-circle model can't tell apart from a real
-touch. Some have a very small `min_normalized_distance` and are plausibly genuine brief
-contacts that weren't logged as "head touches" — a labeling-scope question as much as a
-detector error.
+one-off spike. Precision is still low: see the false-positive review below for what the
+remaining detections are.
 
 ### Review of the 8 false positives
 
-Each extra detection was inspected by viewing the frame at its contact time
-(`results/frames/FP_*.jpg`, generated by `src/visualize_events.py`). This is one frame
-per event, reviewed by eye, not a re-annotation of the video.
+Each extra detection under the strict rule was inspected by viewing the frame at its
+contact time (`results/frames/FP_*.jpg`, generated by `src/visualize_events.py`). This is
+one frame per event, reviewed by eye, not a re-annotation of the video. The review is
+what surfaced the missed forehead touch (detection #5), which is why the ground truth now
+has 4 events.
 
 | Det | Time | Hand | What the frame shows | Verdict |
 |---|---|---|---|---|
 | 2 | 00:47.77 | both | Both open hands raised beside the face, thumbs inside the circle | False positive |
-| 5 | 02:35.80 | right | Right hand flat on the forehead | **Looks like a real head touch, not annotated** |
+| 5 | 02:35.80 | right | Right hand flat on the forehead | **Real head touch; now annotated as GT#4** (a miss under the strict rule only because its contact time is 0.90 s after the annotated landing) |
 | 6 | 03:14.00 | both | Both open hands raised beside the face | False positive |
 | 7 | 03:14.80 | both | Both open hands raised beside the face | False positive |
 | 8 | 03:16.60 | both | Both open hands raised beside the face | False positive |
@@ -281,12 +297,12 @@ per event, reviewed by eye, not a re-annotation of the video.
   falls inside the head circle although nothing touches the head. The circle is the cause:
   its radius is the full ear-to-ear width, so it extends well beyond the actual head, and
   it is centred at eye level.
-- **3 of 8 are genuine hand-on-face contacts** that were not in the ground truth. Detection
-  #5 (forehead) looks like a real head touch and is worth re-checking against the video
-  around 02:34-02:36. If all three were counted as true events, this run would be 6 of 11
-  correct (precision about 0.55) — indicative only, since it depends on what "touching the
-  head" is taken to include and on one person's reading of single frames. The ground truth
-  was not changed.
+- **3 of 8 are genuine hand-on-face contacts.** #5 (forehead) is a real head touch and is
+  now in the ground truth. #10 (chin/jaw) and #11 (eye) are contacts with the lower face
+  and eye, which the ground truth deliberately does **not** count: it covers contact with
+  the head or forehead, not the lower face or eyes. Counting those two as well would give
+  6 of 11 correct (precision about 0.55) — indicative only, since it depends on that scope
+  decision and on one person's reading of single frames.
 - **The same geometry limits recall-friendly settings.** In two of the three true
   positives (#1, #3) the fingertips resting on the top of the head lie *outside* the
   circle, and detection fires because the *wrist* is inside it. Shrinking the circle to
@@ -299,8 +315,8 @@ events, missing a real one is worse than flagging an extra candidate a human can
 rule out.
 
 **Caveat — small-sample tuning.** Both thresholds were tuned against only 3 events from
-one person in one camera setup, so treat 0.27 precision as an in-sample number, not a
-generalization estimate. Validating on other people, cameras and lighting is the real
+one person in one camera setup, so treat 0.27 (strict) / 0.36 (overlap) precision as
+in-sample numbers, not a generalization estimate. Validating on other people, cameras and lighting is the real
 next step, and it is what would decide whether a light trained classifier over these same
 features (distance, speed, dwell) is worth adding.
 
@@ -317,15 +333,24 @@ fingertip landed well inside the head circle (< 1.0) while the wrist had slowed 
   models. Nothing here is trained on this project's data; the annotations are used only to
   evaluate the detector and to tune four numbers (distance threshold, speed threshold,
   enter/exit frame counts).
-- **Results are in-sample.** Those four numbers were tuned against 3 events from one
-  person, one camera and one recording. The reported precision/recall describe that
-  recording, not how the system would do on new footage. With 3 events, one event more or
-  less moves recall by 33 points, and one match (+0.46 s) sits near the ±0.5 s tolerance
-  edge.
-- **Precision is low (0.27), by choice.** Tuning favored recall (never miss a touch) over
-  precision. The 8 false positives were reviewed by eye (see "Review of the 8 false
-  positives"): 5 are open hands raised beside the face, 3 are real face contacts missing
-  from the ground truth. That review is one frame per event by one reviewer.
+- **Results are in-sample.** Those four numbers were tuned against the original 3 events
+  from one person, one camera and one recording, and not re-tuned after a 4th was added.
+  The reported precision/recall describe that recording, not how the system would do on
+  new footage. With 4 events, one event more or less moves recall by 25 points, and one
+  match (+0.46 s) sits near the ±0.5 s tolerance edge.
+- **The ground truth changed after the detector ran.** A missed touch was found through
+  the false-positive review and added. That is a correction of an annotation error, not
+  tuning, and the tuning was not repeated, but it does mean the ground truth was not fully
+  independent of the detector's output. The lenient overlap rule was likewise added after
+  seeing results.
+- **Precision is low (0.27 strict), by choice.** Tuning favored recall (never miss a
+  touch) over precision. The 8 false positives were reviewed by eye (see "Review of the 8
+  false positives"): 5 are open hands raised beside the face, 1 is the missed forehead
+  touch, 2 are real contacts with the lower face / eye that the ground truth does not
+  count. That review is one frame per event by one reviewer.
+- **Detected `contact_time` lags the landing.** It is the frame where the hand is closest,
+  while the annotations mark where it lands, so for a hand that lands and holds it can be
+  a second or more later. Lag on the four touches: +0.30, +0.46, +0.03 and +0.90 s.
 - **Pose vs. Face Mesh was reasoned, not tested.** Pose landmarks were chosen for the
   head because face tracking is expected to degrade when a hand covers the face. The two
   were not compared empirically on this video.
@@ -352,8 +377,13 @@ fingertip landed well inside the head circle (< 1.0) while the wrist had slowed 
 
 ## Reproducing
 
-The repo does not contain the video (345 MB, over GitHub's 100 MB file limit) or the
-model bundles. Given the video at `data/test_video_task.mp4`:
+The source video is a personal recording and is **not shared** (it is also 345 MB, over
+GitHub's 100 MB file limit), and the model bundles are not in the repo. The committed
+`results/` folder holds the detected events, the per-frame signal and annotated frames from
+the run reported here, and `annotations/` holds the ground truth, so the evaluation step
+below can be re-run without the video. Re-running the detection itself needs a video: put
+one at `data/test_video_task.mp4`, or point the commands at your own video (the annotation
+tool in `src/annotate.py` creates matching ground truth for it):
 
 ```powershell
 pip install -r requirements.txt

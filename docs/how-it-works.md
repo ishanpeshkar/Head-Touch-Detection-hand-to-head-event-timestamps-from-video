@@ -79,14 +79,23 @@ landmark joined to the head centre (red).
 
 - **`evaluate.py`** matches detected events to annotated events one-to-one by nearest
   `contact_time` within +/-0.5 s, and reports precision, recall, F1 and timing error. The
-  hand label is reported but does not decide a match.
+  hand label is reported but does not decide a match. `--match-mode overlap` additionally
+  accepts a detection whose `[start, end]` interval overlaps the annotated one.
 - **`tune_threshold.py`** grid-searches four settings (distance threshold, speed threshold,
   enter frames, exit frames) against the annotations, using the cached per-frame signal so
   the slow landmark pass is never repeated.
 
-Result on the recording, 3 annotated touches: **3 of 3 found, 8 extra detections,
-precision 0.27, recall 1.00**, contact times within 0.03-0.46 s of the annotations.
-(Distance-only, without the speed gate: 21 extra detections, precision 0.12.)
+Result on the recording, 4 annotated touches (the 4th was added after the detector ran,
+see the README):
+
+| Matching rule | Found | Extra detections | Precision | Recall |
+|---|---|---|---|---|
+| Strict (contact within +/-0.5 s) | 3 of 4 | 8 | 0.27 | 0.75 |
+| Overlap (also accepts overlapping intervals; added afterwards) | 4 of 4 | 7 | 0.36 | 1.00 |
+
+The 4th touch is detected but its detected contact time (the closest frame) is 0.90 s
+after the annotated landing, so only the overlap rule counts it. Without the speed gate
+the strict rule gives 21 extra detections and precision 0.12.
 
 ## Files
 
@@ -100,23 +109,31 @@ precision 0.27, recall 1.00**, contact times within 0.03-0.46 s of the annotatio
 
 ## What the false positives look like
 
-All 8 extra detections were reviewed by looking at the frame at each one (see the README
-for the full table and `results/frames/`). Five are **open hands raised beside the face**;
-three are **genuine hand-on-face contacts that were not in the ground truth**. The
-frames also show that the head circle is larger than the head and centred at eye level,
-which is the main cause of the false positives and also why some real touches at the
-hairline are detected via the wrist rather than the fingertips.
+All 8 extra detections under the strict rule were reviewed by looking at the frame at each
+one (see the README for the full table and `results/frames/`). Five are **open hands
+raised beside the face**. One is a **real forehead touch that the annotation had missed**;
+it is now ground-truth event 4. Two are **contacts with the lower face and eye**, which
+the ground truth deliberately does not count. The frames also show that the head circle is
+larger than the head and centred at eye level, which is the main cause of the false
+positives and also why some real touches at the hairline are detected via the wrist
+rather than the fingertips.
 
 ![False positive: open hands raised beside the face](../results/frames/FP_det02_00m47.77s.jpg)
 
-![Detected but not annotated: hand on the forehead](../results/frames/FP_det05_02m35.80s.jpg)
+![Forehead touch missed by the annotation, later added as ground-truth event 4](../results/frames/FP_det05_02m35.80s.jpg)
 
 ## Design rationale and caveats
 
 - **Pose over Face Mesh** is a hypothesis about occlusion robustness, not a measured
   result.
-- **The results are in-sample.** The four settings were tuned on 3 events from one person
-  and one camera, so 0.27 precision says little about new footage.
+- **The results are in-sample.** The four settings were tuned on the original 3 events
+  from one person and one camera (not re-tuned after the 4th was added), so 0.27 precision
+  says little about new footage.
+- **The ground truth changed after the detector ran.** The fourth touch was found through
+  the false-positive review. It corrects an annotation error, but it means the ground
+  truth was not fully independent of the detector's output.
+- **Detected contact time lags the landing.** It is the closest frame, while annotations
+  mark where the hand lands: +0.30, +0.46, +0.03 and +0.90 s on the four touches.
 - **Recall was favoured over precision** on purpose: missing a real touch is worse than
   flagging an extra candidate a person can dismiss.
 - **Rule-based, not trained.** The natural next step is a small classifier over the

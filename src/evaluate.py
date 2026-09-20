@@ -36,8 +36,17 @@ def load_events(path: str):
     return events
 
 
-def match_events(ground_truth, detected, tolerance: float):
-    """Greedy nearest-neighbor one-to-one matching on contact_time.
+def match_events(ground_truth, detected, tolerance: float, mode: str = "contact"):
+    """Greedy nearest-neighbor one-to-one matching.
+
+    mode="contact" (default, the headline metric): a detection matches if its
+    contact_time is within `tolerance` seconds of the ground-truth contact_time.
+
+    mode="overlap": a detection also matches if its [start, end] interval
+    overlaps the ground-truth [start, end] interval. Added after seeing that a
+    hand which lands and then holds still gets a detected contact_time (the
+    closest frame) well after the annotated landing moment. Reported as a
+    secondary number, never in place of the strict one.
 
     Returns (matches, unmatched_gt, unmatched_det) where matches is a list
     of (gt_event, det_event, abs_time_diff) sorted by gt contact_time.
@@ -46,7 +55,9 @@ def match_events(ground_truth, detected, tolerance: float):
     for gt in ground_truth:
         for det in detected:
             diff = abs(gt["contact_time"] - det["contact_time"])
-            if diff <= tolerance:
+            overlaps = (mode == "overlap"
+                        and min(gt["end_time"], det["end_time"]) >= max(gt["start_time"], det["start_time"]))
+            if diff <= tolerance or overlaps:
                 candidates.append((diff, gt, det))
     candidates.sort(key=lambda c: c[0])
 
@@ -66,8 +77,8 @@ def match_events(ground_truth, detected, tolerance: float):
     return matches, unmatched_gt, unmatched_det
 
 
-def report(ground_truth, detected, tolerance: float):
-    matches, unmatched_gt, unmatched_det = match_events(ground_truth, detected, tolerance)
+def report(ground_truth, detected, tolerance: float, mode: str = "contact"):
+    matches, unmatched_gt, unmatched_det = match_events(ground_truth, detected, tolerance, mode)
 
     tp = len(matches)
     fn = len(unmatched_gt)
@@ -78,7 +89,7 @@ def report(ground_truth, detected, tolerance: float):
     mean_abs_error = sum(m[2] for m in matches) / tp if tp else float("nan")
 
     print(f"Ground truth events: {len(ground_truth)}   Detected events: {len(detected)}   "
-          f"Tolerance: +/-{tolerance:.2f}s\n")
+          f"Tolerance: +/-{tolerance:.2f}s   Match mode: {mode}\n")
 
     print("Matched (TP):")
     if matches:
@@ -122,11 +133,14 @@ def main():
     parser.add_argument("detected_csv")
     parser.add_argument("--tolerance", type=float, default=0.5,
                          help="Seconds of allowed difference between GT and detected contact_time")
+    parser.add_argument("--match-mode", choices=["contact", "overlap"], default="contact",
+                         help="contact: contact_time within tolerance (default, headline metric). "
+                              "overlap: also accept overlapping [start, end] intervals (secondary)")
     args = parser.parse_args()
 
     ground_truth = load_events(args.ground_truth_csv)
     detected = load_events(args.detected_csv)
-    report(ground_truth, detected, args.tolerance)
+    report(ground_truth, detected, args.tolerance, args.match_mode)
 
 
 if __name__ == "__main__":
