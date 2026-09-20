@@ -34,6 +34,7 @@ from timeutils import format_timestamp
 
 GREEN = (80, 200, 80)
 ORANGE = (0, 140, 255)
+MISS_RED = (90, 90, 255)
 CYAN = (255, 220, 0)
 YELLOW = (0, 255, 255)
 RED = (0, 0, 255)
@@ -117,12 +118,16 @@ def main():
     parser.add_argument("--signal", default=None, help="Cached signal CSV, for labelled dist/speed")
     parser.add_argument("--out", default="results/frames")
     parser.add_argument("--tolerance", type=float, default=0.5)
+    parser.add_argument("--match-mode", choices=["contact", "overlap"], default="overlap",
+                        help="How a detection is matched to ground truth when labelling TP/FP "
+                             "(see evaluate.py). Default overlap, so a touch that is detected but "
+                             "whose contact time lags the annotated landing is still labelled TP")
     parser.add_argument("--warmup-seconds", type=float, default=1.0)
     args = parser.parse_args()
 
     detected = load_events(args.detected_csv)
     ground_truth = load_events(args.ground_truth_csv)
-    matches, _, _ = match_events(ground_truth, detected, args.tolerance)
+    matches, unmatched_gt, _ = match_events(ground_truth, detected, args.tolerance, args.match_mode)
     match_by_det = {id(det): (gt, diff) for gt, det, diff in matches}
 
     signal_lookup = {}
@@ -154,8 +159,9 @@ def main():
         if id(det) in match_by_det:
             gt, diff = match_by_det[id(det)]
             kind = "TP"
+            note = "" if diff <= args.tolerance else ", matched by interval overlap"
             banner = (f"TRUE POSITIVE  det#{det['event_id']} @ {stamp}  "
-                      f"(matches GT#{gt['event_id']}, {diff:.2f}s off)")
+                      f"(matches GT#{gt['event_id']}, contact {diff:.2f}s off{note})")
             color = GREEN
         else:
             kind = "FP"
@@ -163,6 +169,23 @@ def main():
             color = ORANGE
         draw(frame, head, head_points, hands, width, height, banner, color, signal_lookup, target_frame)
         name = f"{kind}_det{int(det['event_id']):02d}_{stamp.replace(':', 'm')}s.jpg"
+        cv2.imwrite(os.path.join(args.out, name), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        print(f"saved {name}")
+
+    # Ground-truth touches the detector never found: there is no detection to
+    # draw, so render the frame at the annotated contact time instead, so a
+    # miss is as visible as a hit.
+    for gt in unmatched_gt:
+        target_frame = int(round(gt["contact_time"] * fps))
+        frame, head, head_points, hands = render_frame(
+            args.video, target_frame, fps, int(args.warmup_seconds * fps), width, height)
+        if frame is None:
+            print(f"GT#{gt['event_id']}: could not read frame {target_frame}")
+            continue
+        stamp = format_timestamp(gt["contact_time"])
+        banner = f"MISSED (false negative)  GT#{gt['event_id']} @ {stamp}  (annotated touch, no detection)"
+        draw(frame, head, head_points, hands, width, height, banner, MISS_RED, signal_lookup, target_frame)
+        name = f"FN_gt{int(gt['event_id']):02d}_{stamp.replace(':', 'm')}s.jpg"
         cv2.imwrite(os.path.join(args.out, name), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         print(f"saved {name}")
 

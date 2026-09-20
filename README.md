@@ -9,7 +9,7 @@ baseline (no ML training) before considering anything more complex.
 ## Development phases
 
 1. **Data Collection / Video Understanding** — done (this document)
-2. **Ground Truth / Annotation** — done, 4 events annotated in `test_video_task_annotations.csv`
+2. **Ground Truth / Annotation** — done, 5 events annotated in `test_video_task_annotations.csv`
 3. **Core Detection** — done (MediaPipe hand + pose landmarks, normalized spatial distance)
 4. **Event Detection + Timestamping** — done (debounced threshold state machine, evaluated against ground truth)
 
@@ -37,13 +37,13 @@ Hand-movement-detection-proj/
 ├── results/                  # committed sample output: detected events, signal, annotated frames
 │   ├── detected_events.csv
 │   ├── distance_signal.csv
-│   └── frames/               # one annotated frame per detected event (TP_* / FP_*)
+│   └── frames/               # one frame per detected event (4 TP_*, 7 FP_*, overlap rule) plus 1 FN_* for the missed touch
 ├── data_example/             # placeholder marking where the video goes (real video not in repo)
 ├── models_example/           # placeholder marking where the model bundles go
 ├── models/                   # MediaPipe .task model bundles, gitignored (run download_models.py)
 ├── annotations/
 │   ├── annotation_format_example.csv   # format reference, not real data
-│   └── test_video_task_annotations.csv # real ground truth (4 events)
+│   └── test_video_task_annotations.csv # real ground truth (5 events)
 ├── outputs/                  # generated artifacts (sample frames, detected events, etc.), gitignored
 ├── .venv/                    # local virtual environment, gitignored
 ├── requirements.txt
@@ -198,7 +198,7 @@ A hand-crafted geometric baseline — no model training, consistent with the pro
 6. **Evaluation.** Detected events are matched to ground-truth events by nearest
    `contact_time`, one-to-one, within a **±0.5 s** tolerance window — generous enough to
    absorb landmark noise while still meaning something, chosen against a ground truth of
-   only 3-4 events. Hand label (left/right) is reported per match as a diagnostic but does
+   only 3-5 events. Hand label (left/right) is reported per match as a diagnostic but does
    **not** gate the match, since MediaPipe's handedness convention can come out mirrored
    relative to the real-world hand depending on how the source video was captured.
 
@@ -235,50 +235,63 @@ caches the raw per-frame distances and wrist positions, retuning never needs the
 
 Run against `data/test_video_task.mp4` (5:12, 9,349 frames) with the tuned defaults
 (`--threshold 1.0 --velocity-threshold 0.5 --enter-frames 3 --exit-frames 10`, picked via
-`src/tune_threshold.py` grid-searching against ground truth):
+`src/tune_threshold.py` grid-searching against ground truth).
 
-**Ground truth: 4 annotated touches.** The original annotation had 3. During the
-false-positive review (below) a fourth touch (right hand flat on the forehead, annotated
-02:34.03 / 02:34.90 / 02:36.10) turned out to have been missed by the annotator and was
-added afterwards. **The thresholds were tuned before it was added, on the original 3
-events, and were not re-tuned.**
+**Ground truth: 5 annotated touches, built up in three steps.**
+1. The original annotation had 3 touches. **The thresholds were tuned on these 3 only.**
+2. A 4th (right hand flat on the forehead, 02:34.03 / 02:34.90 / 02:36.10) was found during
+   the false-positive review below and added.
+3. A 5th (right hand, a quick touch, 03:17.70 / 03:18.13 / 03:18.60) was noticed afterwards
+   and added. The detector does not find it.
+
+**Neither addition triggered a re-tune.** Two of the five touches were therefore added
+after the detector's output had been seen; see the limitations.
 
 Two matching rules are reported. The **strict** rule is the headline: a detection matches
 if its `contact_time` is within ±0.5 s of the annotated `contact_time`. The **overlap**
 rule additionally accepts a detection whose `[start, end]` interval overlaps the annotated
-one. It was added *after* seeing that the strict rule scores the fourth touch as a miss,
-so treat it as a secondary, more lenient number, not a replacement.
+one. It was added *after* seeing that the strict rule scores the 4th touch as a miss, so
+treat it as a secondary, more lenient number, not a replacement.
 
-| Metric (4 annotated touches) | Distance only, strict | Speed gate, **strict** | Speed gate, overlap |
-|---|---|---|---|
-| Detected events | 24 | 11 | 11 |
-| True positives | 3 | 3 | 4 |
-| False negatives (missed) | 1 | 1 | 0 |
-| False positives (extra) | 21 | 8 | 7 |
-| **Recall** | 0.75 | **0.75** | 1.00 |
-| **Precision** | 0.12 | **0.27** | 0.36 |
-| F1 | 0.21 | 0.40 | 0.53 |
-| Mean timing error on matches | 0.20 s | 0.26 s | 0.42 s |
+| 5 annotated touches | Distance only, strict | **Speed gate, strict** | Distance only, overlap | Speed gate, overlap |
+|---|---|---|---|---|
+| Detected events | 24 | 11 | 24 | 11 |
+| True positives | 4 | 3 | 5 | 4 |
+| False negatives (missed) | 1 | 2 | 0 | 1 |
+| False positives (extra) | 20 | 8 | 19 | 7 |
+| **Recall** | 0.80 | **0.60** | 1.00 | 0.80 |
+| **Precision** | 0.17 | **0.27** | 0.21 | 0.36 |
+| F1 | 0.28 | 0.37 | 0.34 | 0.50 |
+| Mean timing error on matches | 0.22 s | 0.26 s | 0.35 s | 0.42 s |
 
-(Distance only with overlap matching: precision 0.17, recall 1.00.)
+**The speed gate is a trade-off, not a free improvement.** It cut extra detections from 20
+to 8 (strict), but it lowers recall from 0.80 to 0.60, because it rejects the 5th touch,
+which the distance-only version does find. That touch is quick: while the hand is close to
+the head (distance 0.77–0.96, from about 03:18.03 to 03:18.47) its wrist speed is
+0.74–3.55 head-widths/sec (mostly 0.7–1.5), always above the 0.5 threshold, so no frame
+counts as slow. The
+gate assumes a touch is a hand coming to rest; a brief tap does not.
+Separately, 58 (frame, hand) pairs in the signal contain two detections with the *same*
+hand label (MediaPipe labelled both hands "Right" in that frame), which interleaves two
+hands in the per-hand speed calculation and produced unknown speeds at the start of this
+touch. That is a bug in how hand identity is handled, not fixed here.
 
-The fourth touch is *detected* (detection #5) but scores as a miss under the strict rule.
-The hand lands at about 02:34.9 and stays on the forehead until about 02:36.1. The annotation marks the
-landing, while the detector's `contact_time` is the frame where the hand is *closest*, which
-here is 02:35.80, 0.90 s later. The same lag shows in two of the other three touches
-(+0.30 s and +0.46 s; the third is +0.03 s). The speed gate still cut false positives from
-21 to 8 without losing any touch the distance-only version found; the 0.5
-head-widths/sec setting held across neighbouring enter/exit values rather than being a
-one-off spike. Precision is still low: see the false-positive review below for what the
-remaining detections are.
+The 4th touch is *detected* (detection #5) but scores as a miss under the strict rule. The
+hand lands at about 02:34.9 and stays on the forehead until about 02:36.1. The annotation
+marks the landing, while the detector's `contact_time` is the frame where the hand is
+*closest*, which here is 02:35.80, 0.90 s later. The same lag shows in two of the other
+detected touches (+0.30 s and +0.46 s; the third is +0.03 s). Precision is still low: see
+the false-positive review below for what the extra detections are.
 
 ### Review of the 8 false positives
 
 Each extra detection under the strict rule was inspected by viewing the frame at its
-contact time (`results/frames/FP_*.jpg`, generated by `src/visualize_events.py`). This is
+contact time (`results/frames/`, generated by `src/visualize_events.py`; the frames are
+labelled with the overlap rule, so detection #5 appears as `TP_det05`). This is
 one frame per event, reviewed by eye, not a re-annotation of the video. The review is
-what surfaced the missed forehead touch (detection #5), which is why the ground truth now
-has 4 events.
+what surfaced the missed forehead touch (detection #5), which was then added to the ground
+truth. The 5th touch (03:18) has no detection, so it appears as `FN_gt05_03m18.13s.jpg`,
+a frame at the annotated contact time labelled as a miss, not as a true positive.
 
 | Det | Time | Hand | What the frame shows | Verdict |
 |---|---|---|---|---|
@@ -300,11 +313,11 @@ has 4 events.
 - **3 of 8 are genuine hand-on-face contacts.** #5 (forehead) is a real head touch and is
   now in the ground truth. #10 (chin/jaw) and #11 (eye) are contacts with the lower face
   and eye, which the ground truth deliberately does **not** count: it covers contact with
-  the head or forehead, not the lower face or eyes. Counting those two as well would give
-  6 of 11 correct (precision about 0.55) — indicative only, since it depends on that scope
+  the head or forehead, not the lower face or eyes. Counting those two as well, on top of
+  the 4 overlap-rule true positives, would give 6 of 11 correct (precision about 0.55) — indicative only, since it depends on that scope
   decision and on one person's reading of single frames.
-- **The same geometry limits recall-friendly settings.** In two of the three true
-  positives (#1, #3) the fingertips resting on the top of the head lie *outside* the
+- **The same geometry limits recall-friendly settings.** In two of the true
+  positives (ground-truth touches #1 and #3) the fingertips resting on the top of the head lie *outside* the
   circle, and detection fires because the *wrist* is inside it. Shrinking the circle to
   remove the open-hand false positives would therefore also lose those touches unless the
   circle is moved up toward the top of the head. This was not tried; it is the first
@@ -312,12 +325,14 @@ has 4 events.
 
 **Why recall was favored over precision:** for a system meant to *find* head-touch
 events, missing a real one is worse than flagging an extra candidate a human can quickly
-rule out.
+rule out. That was the aim when tuning on the original 3 touches; on the 5-touch ground
+truth the speed gate actually lowers recall (0.80 to 0.60 strict), which is the opposite
+of that aim and the first thing to revisit.
 
-**Caveat — small-sample tuning.** Both thresholds were tuned against only 3 events from
-one person in one camera setup, so treat 0.27 (strict) / 0.36 (overlap) precision as
-in-sample numbers, not a generalization estimate. Validating on other people, cameras and lighting is the real
-next step, and it is what would decide whether a light trained classifier over these same
+**Caveat — small-sample tuning.** Both thresholds were tuned against only the original 3
+events from one person in one camera setup, so treat 0.27 (strict) / 0.36 (overlap)
+precision as in-sample numbers, not a generalization estimate. Validating on other people,
+cameras and lighting is the real next step, and it is what would decide whether a light trained classifier over these same
 features (distance, speed, dwell) is worth adding.
 
 ### Worked example
@@ -334,23 +349,28 @@ fingertip landed well inside the head circle (< 1.0) while the wrist had slowed 
   evaluate the detector and to tune four numbers (distance threshold, speed threshold,
   enter/exit frame counts).
 - **Results are in-sample.** Those four numbers were tuned against the original 3 events
-  from one person, one camera and one recording, and not re-tuned after a 4th was added.
-  The reported precision/recall describe that recording, not how the system would do on
-  new footage. With 4 events, one event more or less moves recall by 25 points, and one
+  from one person, one camera and one recording, and not re-tuned after a 4th and 5th were
+  added. The reported precision/recall describe that recording, not how the system would do
+  on new footage. With 5 events, one event more or less moves recall by 20 points, and one
   match (+0.46 s) sits near the ±0.5 s tolerance edge.
-- **The ground truth changed after the detector ran.** A missed touch was found through
-  the false-positive review and added. That is a correction of an annotation error, not
-  tuning, and the tuning was not repeated, but it does mean the ground truth was not fully
-  independent of the detector's output. The lenient overlap rule was likewise added after
-  seeing results.
-- **Precision is low (0.27 strict), by choice.** Tuning favored recall (never miss a
-  touch) over precision. The 8 false positives were reviewed by eye (see "Review of the 8
+- **The ground truth changed after the detector ran.** Two touches were added afterwards:
+  the 4th was found through the false-positive review, the 5th was noticed later. These
+  are corrections of annotation errors, not tuning, and the tuning was not repeated, but
+  the ground truth is not fully independent of the detector's output. The lenient overlap
+  rule was likewise added after seeing results.
+- **The speed gate misses quick touches.** A brief tap that never comes to rest (the 5th
+  touch) stays above the speed threshold and is rejected; the distance-only version finds
+  it. The gate trades recall for precision.
+- **Hand identity is just the MediaPipe label.** In 58 (frame, hand) pairs both hands get
+  the same label, which merges two hands into one track for speed and event extraction.
+- **Precision is low (0.27 strict).** The 8 false positives were reviewed by eye (see "Review of the 8
   false positives"): 5 are open hands raised beside the face, 1 is the missed forehead
   touch, 2 are real contacts with the lower face / eye that the ground truth does not
   count. That review is one frame per event by one reviewer.
 - **Detected `contact_time` lags the landing.** It is the frame where the hand is closest,
   while the annotations mark where it lands, so for a hand that lands and holds it can be
-  a second or more later. Lag on the four touches: +0.30, +0.46, +0.03 and +0.90 s.
+  a second or more later. Lag on the four detected touches: +0.30, +0.46, +0.03 and
+  +0.90 s (the 5th touch is not detected).
 - **Pose vs. Face Mesh was reasoned, not tested.** Pose landmarks were chosen for the
   head because face tracking is expected to degrade when a hand covers the face. The two
   were not compared empirically on this video.
@@ -367,7 +387,7 @@ fingertip landed well inside the head circle (< 1.0) while the wrist had slowed 
   or no usable head estimate is found the frame produces no row, so touches during
   detection dropouts can be missed.
 - **Hand labels happened to match.** MediaPipe's left/right labels agreed with the
-  annotations on all 3 matches for this video, so no mirroring correction was needed;
+  annotations on every matched touch for this video, so no mirroring correction was needed;
   this may not hold for other cameras (e.g. mirrored webcams). Matching therefore ignores
   the label and reports it as a diagnostic.
 - **Toward production.** Validate on multiple people/cameras/lighting first. If precision

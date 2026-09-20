@@ -85,17 +85,31 @@ landmark joined to the head centre (red).
   enter frames, exit frames) against the annotations, using the cached per-frame signal so
   the slow landmark pass is never repeated.
 
-Result on the recording, 4 annotated touches (the 4th was added after the detector ran,
-see the README):
+Result on the recording, 5 annotated touches. The original annotation had 3 and the
+settings were tuned on those; a 4th and a 5th were added after the detector's output had
+been seen (see the README):
 
-| Matching rule | Found | Extra detections | Precision | Recall |
-|---|---|---|---|---|
-| Strict (contact within +/-0.5 s) | 3 of 4 | 8 | 0.27 | 0.75 |
-| Overlap (also accepts overlapping intervals; added afterwards) | 4 of 4 | 7 | 0.36 | 1.00 |
+| Matching rule | Config | Found | Extra detections | Precision | Recall |
+|---|---|---|---|---|---|
+| Strict (contact within +/-0.5 s), headline | Speed gate (current) | 3 of 5 | 8 | 0.27 | 0.60 |
+| Overlap (also accepts overlapping intervals; added afterwards) | Speed gate (current) | 4 of 5 | 7 | 0.36 | 0.80 |
+| Strict | Distance only | 4 of 5 | 20 | 0.17 | 0.80 |
+| Overlap | Distance only | 5 of 5 | 19 | 0.21 | 1.00 |
 
-The 4th touch is detected but its detected contact time (the closest frame) is 0.90 s
-after the annotated landing, so only the overlap rule counts it. Without the speed gate
-the strict rule gives 21 extra detections and precision 0.12.
+Two touches are not counted by the strict rule with the speed gate:
+- The 4th (forehead) is detected, but its detected contact time (the closest frame) is
+  0.90 s after the annotated landing, so only the overlap rule counts it.
+- The 5th (a quick touch at 03:18) is not detected at all. Its wrist speed while close to
+  the head is 0.74-3.55 head-widths/sec (mostly 0.7-1.5), always above the 0.5 threshold,
+  so the gate rejects it; the distance-only version finds it.
+
+So the speed gate is a trade-off: it cuts extra detections from 20 to 8 but lowers recall
+from 0.80 to 0.60 (strict).
+
+The missed 5th touch, at the annotated contact time. The hand is on the head and inside
+the circle (distance 0.89), but no detection fires because the hand is still moving:
+
+![Missed touch: annotated ground-truth event 5, no detection](../results/frames/FN_gt05_03m18.13s.jpg)
 
 ## Files
 
@@ -112,30 +126,35 @@ the strict rule gives 21 extra detections and precision 0.12.
 All 8 extra detections under the strict rule were reviewed by looking at the frame at each
 one (see the README for the full table and `results/frames/`). Five are **open hands
 raised beside the face**. One is a **real forehead touch that the annotation had missed**;
-it is now ground-truth event 4. Two are **contacts with the lower face and eye**, which
-the ground truth deliberately does not count. The frames also show that the head circle is
+it was added as ground-truth event 4. Two are **contacts with the lower face and eye**,
+which the ground truth deliberately does not count. The frames also show that the head circle is
 larger than the head and centred at eye level, which is the main cause of the false
 positives and also why some real touches at the hairline are detected via the wrist
 rather than the fingertips.
 
 ![False positive: open hands raised beside the face](../results/frames/FP_det02_00m47.77s.jpg)
 
-![Forehead touch missed by the annotation, later added as ground-truth event 4](../results/frames/FP_det05_02m35.80s.jpg)
+![True positive by interval overlap: the forehead touch the annotation had missed, now ground-truth event 4](../results/frames/TP_det05_02m35.80s.jpg)
 
 ## Design rationale and caveats
 
 - **Pose over Face Mesh** is a hypothesis about occlusion robustness, not a measured
   result.
 - **The results are in-sample.** The four settings were tuned on the original 3 events
-  from one person and one camera (not re-tuned after the 4th was added), so 0.27 precision
-  says little about new footage.
-- **The ground truth changed after the detector ran.** The fourth touch was found through
-  the false-positive review. It corrects an annotation error, but it means the ground
-  truth was not fully independent of the detector's output.
+  from one person and one camera (not re-tuned after the 4th and 5th were added), so 0.27
+  precision says little about new footage.
+- **The ground truth changed after the detector ran.** The 4th touch was found through
+  the false-positive review and the 5th was noticed later. These correct annotation
+  errors, but the ground truth is not fully independent of the detector's output.
+- **The speed gate misses quick touches** that never come to rest, such as the 5th touch.
+- **Hand identity is only the MediaPipe left/right label.** In 58 (frame, hand) pairs both
+  hands get the same label, which merges two hands in the speed and event logic.
 - **Detected contact time lags the landing.** It is the closest frame, while annotations
-  mark where the hand lands: +0.30, +0.46, +0.03 and +0.90 s on the four touches.
-- **Recall was favoured over precision** on purpose: missing a real touch is worse than
-  flagging an extra candidate a person can dismiss.
+  mark where the hand lands: +0.30, +0.46, +0.03 and +0.90 s on the four detected
+  touches.
+- **Recall was favoured over precision** as the aim when tuning on the 3 original touches:
+  missing a real touch is worse than flagging an extra candidate a person can dismiss. On
+  the 5-touch ground truth the speed gate lowers recall, so that aim is not met.
 - **Rule-based, not trained.** The natural next step is a small classifier over the
   existing features (distance, speed, dwell time), but only once footage from several
   people and cameras is available. Better head geometry (a smaller circle centred higher,
