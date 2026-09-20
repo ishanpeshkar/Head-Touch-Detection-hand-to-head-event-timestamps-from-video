@@ -125,19 +125,8 @@ def head_center_and_scale(pose_landmarks, width, height):
     return center, scale, source
 
 
-def compute_distance_signal(video_path: str, max_hands: int = 2):
-    """Run pose + hand landmarkers over every frame and yield one dict per
-    (frame, detected hand): {frame, time_sec, hand, normalized_distance,
-    head_scale_px, head_source}. Frames with no usable head estimate or no
-    detected hand are skipped (no row emitted)."""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Could not open video: {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
+def create_landmarkers(max_hands: int = 2):
+    """Return (hand_landmarker, pose_landmarker), both in VIDEO mode."""
     hand_landmarker = vision.HandLandmarker.create_from_options(
         vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=HAND_MODEL_PATH),
@@ -156,6 +145,23 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
             min_tracking_confidence=0.5,
         )
     )
+    return hand_landmarker, pose_landmarker
+
+
+def compute_distance_signal(video_path: str, max_hands: int = 2):
+    """Run pose + hand landmarkers over every frame and yield one dict per
+    (frame, detected hand): {frame, time_sec, hand, normalized_distance,
+    head_scale_px, head_source}. Frames with no usable head estimate or no
+    detected hand are skipped (no row emitted)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Could not open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    hand_landmarker, pose_landmarker = create_landmarkers(max_hands)
 
     frame_idx = 0
     try:
