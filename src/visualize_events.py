@@ -28,7 +28,7 @@ import mediapipe as mp
 from evaluate import load_events, match_events
 from head_touch_detector import (
     HAND_CONTACT_LANDMARK_IDS, HEAD_LANDMARK_IDS, _dist, _to_px, add_velocities,
-    create_landmarkers, head_center_and_scale, load_signal_csv,
+    apply_head_geometry, create_landmarkers, head_center_and_scale, load_signal_csv,
 )
 from timeutils import format_timestamp
 
@@ -79,11 +79,15 @@ def render_frame(video_path, target_frame, fps, warmup_frames, width, height):
     return frame_bgr, head, head_points, hands
 
 
-def draw(frame, head, head_points, hands, width, height, banner, banner_color, signal_lookup, frame_idx):
+def draw(frame, head, head_points, hands, width, height, banner, banner_color, signal_lookup, frame_idx,
+         up=0.0, radius=1.0):
+    """Draws the head zone: a circle of `radius` x head_scale centred `up` x head_scale
+    above the eye-level centre (its edge is normalized distance 1.0)."""
     if head is not None:
         center, scale, source = head
+        center = (center[0], center[1] - up * scale)
         c = (int(center[0]), int(center[1]))
-        cv2.circle(frame, c, int(scale), CYAN, 2, cv2.LINE_AA)
+        cv2.circle(frame, c, int(radius * scale), CYAN, 2, cv2.LINE_AA)
         cv2.circle(frame, c, 4, CYAN, -1, cv2.LINE_AA)
         for p in head_points:
             cv2.circle(frame, (int(p[0]), int(p[1])), 4, WHITE, -1, cv2.LINE_AA)
@@ -93,9 +97,8 @@ def draw(frame, head, head_points, hands, width, height, banner, banner_color, s
             color = YELLOW if i == 0 else GREEN
             cv2.circle(frame, (int(p[0]), int(p[1])), 6, color, -1, cv2.LINE_AA)
         if head is not None:
-            closest = min(pts.values(), key=lambda p: _dist(p, head[0]))
-            cv2.line(frame, (int(closest[0]), int(closest[1])),
-                     (int(head[0][0]), int(head[0][1])), RED, 2, cv2.LINE_AA)
+            closest = min(pts.values(), key=lambda p: _dist(p, center))
+            cv2.line(frame, (int(closest[0]), int(closest[1])), c, RED, 2, cv2.LINE_AA)
             cv2.circle(frame, (int(closest[0]), int(closest[1])), 10, RED, 2, cv2.LINE_AA)
         row = signal_lookup.get((frame_idx, label))
         info = f"{label}"
@@ -122,6 +125,10 @@ def main():
                         help="How a detection is matched to ground truth when labelling TP/FP "
                              "(see evaluate.py). Default overlap, so a touch that is detected but "
                              "whose contact time lags the annotated landing is still labelled TP")
+    parser.add_argument("--head-up", type=float, default=0.6,
+                        help="Head zone centre raised by this many head-widths (match the detector)")
+    parser.add_argument("--head-radius", type=float, default=0.6,
+                        help="Head zone radius in head-widths (match the detector)")
     parser.add_argument("--warmup-seconds", type=float, default=1.0)
     args = parser.parse_args()
 
@@ -133,6 +140,7 @@ def main():
     signal_lookup = {}
     if args.signal:
         rows = load_signal_csv(args.signal)
+        apply_head_geometry(rows, args.head_up, args.head_radius)
         by_hand = {}
         for r in rows:
             by_hand.setdefault(r["hand"], []).append(r)
@@ -167,7 +175,8 @@ def main():
             kind = "FP"
             banner = f"FALSE POSITIVE  det#{det['event_id']} @ {stamp}  (no matching ground truth)"
             color = ORANGE
-        draw(frame, head, head_points, hands, width, height, banner, color, signal_lookup, target_frame)
+        draw(frame, head, head_points, hands, width, height, banner, color, signal_lookup, target_frame,
+             args.head_up, args.head_radius)
         name = f"{kind}_det{int(det['event_id']):02d}_{stamp.replace(':', 'm')}s.jpg"
         cv2.imwrite(os.path.join(args.out, name), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         print(f"saved {name}")
@@ -184,7 +193,8 @@ def main():
             continue
         stamp = format_timestamp(gt["contact_time"])
         banner = f"MISSED (false negative)  GT#{gt['event_id']} @ {stamp}  (annotated touch, no detection)"
-        draw(frame, head, head_points, hands, width, height, banner, MISS_RED, signal_lookup, target_frame)
+        draw(frame, head, head_points, hands, width, height, banner, MISS_RED, signal_lookup, target_frame,
+             args.head_up, args.head_radius)
         name = f"FN_gt{int(gt['event_id']):02d}_{stamp.replace(':', 'm')}s.jpg"
         cv2.imwrite(os.path.join(args.out, name), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         print(f"saved {name}")

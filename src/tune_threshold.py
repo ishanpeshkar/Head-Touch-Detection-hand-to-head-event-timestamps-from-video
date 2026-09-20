@@ -4,11 +4,15 @@ extraction each time.
 
 This is what actually produced the `--threshold` / `--enter-frames` /
 `--exit-frames` defaults documented in the README: not a guess, but a
-grid search against the 3 ground-truth events, scored by F1 (ties broken
-by lower mean timing error). With only 3 ground-truth events this is a
+grid search against the ground-truth events, scored by F1 (ties broken
+by lower mean timing error). With only a handful of ground-truth events this is a
 coarse signal and shouldn't be over-trusted -- see the README's Results
 section for the caveat -- but it's more principled than hand-picking
 numbers.
+
+This tunes the four gate/state-machine settings for a GIVEN head shape. The head
+shape itself (--head-up / --head-radius) is explored separately by
+geometry_experiment.py.
 
 Usage:
     python src/tune_threshold.py outputs/distance_signal.csv \\
@@ -17,7 +21,7 @@ Usage:
 
 import argparse
 
-from head_touch_detector import extract_events, load_signal_csv
+from head_touch_detector import apply_head_geometry, extract_events, load_signal_csv
 from evaluate import load_events, match_events
 
 
@@ -26,9 +30,14 @@ def main():
     parser.add_argument("signal_csv")
     parser.add_argument("ground_truth_csv")
     parser.add_argument("--tolerance", type=float, default=0.5)
+    parser.add_argument("--head-up", type=float, default=0.6,
+                        help="Head zone centre raised by this many head-widths (0 = original model)")
+    parser.add_argument("--head-radius", type=float, default=0.6,
+                        help="Head zone radius in head-widths (1.0 = original model)")
     args = parser.parse_args()
 
     signal_rows = load_signal_csv(args.signal_csv)
+    apply_head_geometry(signal_rows, args.head_up, args.head_radius)
     ground_truth = load_events(args.ground_truth_csv)
 
     thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]

@@ -71,8 +71,11 @@ VISIBILITY_THRESHOLD = 0.5
 HAND_CONTACT_LANDMARK_IDS = [0, 4, 8, 12, 16, 20]  # wrist + 5 fingertips
 
 EVENTS_CSV_HEADER = ["event_id", "start_time", "contact_time", "end_time", "hand", "notes"]
+# Raw geometry is stored alongside the distance so head-shape variants (see
+# apply_head_geometry) can be tested offline without re-running the landmarkers.
+CONTACT_COLUMNS = [f"c{i}_{axis}" for i in HAND_CONTACT_LANDMARK_IDS for axis in ("x", "y")]
 SIGNAL_CSV_HEADER = ["frame", "time_sec", "hand", "normalized_distance", "head_scale_px", "head_source",
-                     "wrist_x", "wrist_y"]
+                     "wrist_x", "wrist_y", "head_cx", "head_cy"] + CONTACT_COLUMNS
 
 WRIST_ID = 0
 # Velocity is only trusted across short gaps in hand detection; a longer gap
@@ -185,10 +188,9 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
                     center, scale, source = head
                     for hand_landmarks, handedness in zip(hand_result.hand_landmarks, hand_result.handedness):
                         hand_label = handedness[0].category_name  # 'Left' / 'Right'
-                        min_px_dist = min(
-                            _dist(_to_px(hand_landmarks[i], width, height), center)
-                            for i in HAND_CONTACT_LANDMARK_IDS
-                        )
+                        contact_px = {i: _to_px(hand_landmarks[i], width, height)
+                                      for i in HAND_CONTACT_LANDMARK_IDS}
+                        min_px_dist = min(_dist(p, center) for p in contact_px.values())
                         wrist_x, wrist_y = _to_px(hand_landmarks[WRIST_ID], width, height)
                         yield {
                             "frame": frame_idx,
@@ -199,6 +201,10 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
                             "head_source": source,
                             "wrist_x": wrist_x,
                             "wrist_y": wrist_y,
+                            "head_cx": center[0],
+                            "head_cy": center[1],
+                            **{f"c{i}_{axis}": contact_px[i][k]
+                               for i in HAND_CONTACT_LANDMARK_IDS for k, axis in enumerate(("x", "y"))},
                         }
             frame_idx += 1
     finally:
@@ -333,6 +339,8 @@ def write_signal_csv(path: str, rows) -> None:
                 row["frame"], f"{row['time_sec']:.3f}", row["hand"],
                 f"{row['normalized_distance']:.4f}", f"{row['head_scale_px']:.2f}", row["head_source"],
                 f"{row['wrist_x']:.2f}", f"{row['wrist_y']:.2f}",
+                f"{row['head_cx']:.2f}", f"{row['head_cy']:.2f}",
+                *[f"{row[c]:.2f}" for c in CONTACT_COLUMNS],
             ])
 
 
@@ -353,8 +361,28 @@ def load_signal_csv(path: str):
                 "head_source": row["head_source"],
                 "wrist_x": float(row["wrist_x"]),
                 "wrist_y": float(row["wrist_y"]),
+                # Raw geometry; absent in signal CSVs written before it was stored.
+                **({"head_cx": float(row["head_cx"]), "head_cy": float(row["head_cy"]),
+                    **{c: float(row[c]) for c in CONTACT_COLUMNS}}
+                   if "head_cx" in row else {}),
             })
     return rows
+
+
+def apply_head_geometry(rows, up: float = 0.0, radius: float = 1.0) -> None:
+    """Recompute each row's normalized_distance for a different head shape.
+
+    The head is a circle centred `up` x head_scale above the eye-level centre,
+    with radius `radius` x head_scale. up=0, radius=1 is the original model
+    (radius = full ear-to-ear width, centred at eye level) and reproduces the
+    distances computed at extraction time. Needs the raw geometry columns.
+    """
+    for row in rows:
+        cx, cy = row["head_cx"], row["head_cy"] - up * row["head_scale_px"]
+        r = radius * row["head_scale_px"]
+        row["normalized_distance"] = min(
+            _dist((row[f"c{i}_x"], row[f"c{i}_y"]), (cx, cy)) for i in HAND_CONTACT_LANDMARK_IDS
+        ) / r
 
 
 def write_events_csv(path: str, events) -> None:
@@ -387,9 +415,14 @@ def main():
                          help="Consecutive above-threshold frames required to confirm touch end")
     parser.add_argument("--contact-window", type=float, default=1.5,
                          help="Seconds after touch start to search for the contact (min-distance) frame")
-    parser.add_argument("--velocity-threshold", type=float, default=0.5,
+    parser.add_argument("--velocity-threshold", type=float, default=1.5,
                          help="Max wrist speed (head-widths/sec) for a frame to count as touching; "
                               "omit to disable the velocity gate")
+    parser.add_argument("--head-up", type=float, default=0.6,
+                         help="Raise the head circle's centre by this many head-widths above the "
+                              "eye-level centre (0 = original model)")
+    parser.add_argument("--head-radius", type=float, default=0.6,
+                         help="Head circle radius in head-widths (1.0 = original model)")
     parser.add_argument("--max-hands", type=int, default=2)
     args = parser.parse_args()
 
@@ -404,6 +437,15 @@ def main():
     if args.signal_csv and not args.from_signal:
         write_signal_csv(args.signal_csv, signal_rows)
         print(f"Wrote raw distance signal to {args.signal_csv}")
+
+    # Applied after the signal is written, so a cached signal always holds the
+    # original-geometry distances plus the raw geometry needed to change the shape.
+    if (args.head_up, args.head_radius) != (0.0, 1.0):
+        try:
+            apply_head_geometry(signal_rows, args.head_up, args.head_radius)
+        except KeyError:
+            raise SystemExit("This signal CSV predates stored geometry; re-run extraction, or pass "
+                             "--head-up 0 --head-radius 1 to use the original head model.")
 
     events = extract_events(signal_rows, args.threshold, args.enter_frames, args.exit_frames,
                              contact_window_seconds=args.contact_window,
