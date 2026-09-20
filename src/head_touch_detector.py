@@ -38,6 +38,9 @@ Method (see README for the full write-up):
    from the hand covering part of the head is expected right when contact
    happens.
 
+The event logic is incremental (HandTouchTracker / TouchDetector), so the same code
+runs on a finished recording here and frame by frame in live_demo.py.
+
 This is deliberately a hand-crafted geometric baseline, not a trained
 classifier -- consistent with the project's Phase 1/2 "no ML training
 yet" approach.
@@ -51,6 +54,7 @@ Usage:
 import argparse
 import csv
 import os
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -151,11 +155,47 @@ def create_landmarkers(max_hands: int = 2):
     return hand_landmarker, pose_landmarker
 
 
+def analyze_frame(pose_result, hand_result, width, height, frame_idx, time_sec):
+    """Turn one frame's MediaPipe results into signal rows.
+
+    Returns (rows, head): one row dict per detected hand (empty when there is no
+    usable head estimate or no hand) and head = (center, scale, source) or None.
+    Shared by the batch pass (compute_distance_signal) and the live demo, so both
+    compute identical rows from the same landmarks.
+    """
+    rows, head = [], None
+    if pose_result.pose_landmarks:
+        head = head_center_and_scale(pose_result.pose_landmarks[0], width, height)
+    if head is not None and hand_result.hand_landmarks:
+        center, scale, source = head
+        for hand_landmarks, handedness in zip(hand_result.hand_landmarks, hand_result.handedness):
+            hand_label = handedness[0].category_name  # 'Left' / 'Right'
+            contact_px = {i: _to_px(hand_landmarks[i], width, height)
+                          for i in HAND_CONTACT_LANDMARK_IDS}
+            min_px_dist = min(_dist(p, center) for p in contact_px.values())
+            wrist_x, wrist_y = _to_px(hand_landmarks[WRIST_ID], width, height)
+            rows.append({
+                "frame": frame_idx,
+                "time_sec": time_sec,
+                "hand": hand_label,
+                "normalized_distance": min_px_dist / scale,
+                "head_scale_px": scale,
+                "head_source": source,
+                "wrist_x": wrist_x,
+                "wrist_y": wrist_y,
+                "head_cx": center[0],
+                "head_cy": center[1],
+                **{f"c{i}_{axis}": contact_px[i][k]
+                   for i in HAND_CONTACT_LANDMARK_IDS for k, axis in enumerate(("x", "y"))},
+            })
+    return rows, head
+
+
 def compute_distance_signal(video_path: str, max_hands: int = 2):
     """Run pose + hand landmarkers over every frame and yield one dict per
     (frame, detected hand): {frame, time_sec, hand, normalized_distance,
-    head_scale_px, head_source}. Frames with no usable head estimate or no
-    detected hand are skipped (no row emitted)."""
+    head_scale_px, head_source, ...raw geometry}. Frames with no usable head
+    estimate or no detected hand are skipped (no row emitted)."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Could not open video: {video_path}")
@@ -182,30 +222,8 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
             if frame_idx % 300 == 0:
                 print(f"  frame {frame_idx}/{frame_count} ({frame_idx / fps:.1f}s)")
 
-            if pose_result.pose_landmarks and hand_result.hand_landmarks:
-                head = head_center_and_scale(pose_result.pose_landmarks[0], width, height)
-                if head is not None:
-                    center, scale, source = head
-                    for hand_landmarks, handedness in zip(hand_result.hand_landmarks, hand_result.handedness):
-                        hand_label = handedness[0].category_name  # 'Left' / 'Right'
-                        contact_px = {i: _to_px(hand_landmarks[i], width, height)
-                                      for i in HAND_CONTACT_LANDMARK_IDS}
-                        min_px_dist = min(_dist(p, center) for p in contact_px.values())
-                        wrist_x, wrist_y = _to_px(hand_landmarks[WRIST_ID], width, height)
-                        yield {
-                            "frame": frame_idx,
-                            "time_sec": frame_idx / fps,
-                            "hand": hand_label,
-                            "normalized_distance": min_px_dist / scale,
-                            "head_scale_px": scale,
-                            "head_source": source,
-                            "wrist_x": wrist_x,
-                            "wrist_y": wrist_y,
-                            "head_cx": center[0],
-                            "head_cy": center[1],
-                            **{f"c{i}_{axis}": contact_px[i][k]
-                               for i in HAND_CONTACT_LANDMARK_IDS for k, axis in enumerate(("x", "y"))},
-                        }
+            rows, _ = analyze_frame(pose_result, hand_result, width, height, frame_idx, frame_idx / fps)
+            yield from rows
             frame_idx += 1
     finally:
         cap.release()
@@ -213,118 +231,235 @@ def compute_distance_signal(video_path: str, max_hands: int = 2):
         pose_landmarker.close()
 
 
-def add_velocities(rows) -> None:
-    """Annotate time-sorted rows of ONE hand with a `velocity` key, in
-    head-widths per second (wrist speed / head_scale_px).
+class VelocityTracker:
+    """Wrist speed for ONE hand, in head-widths per second, fed one row at a time.
 
-    The wrist is used as the anchor rather than the closest-of-several
-    contact landmarks used for distance, because that "closest" landmark
-    can flip between fingertips frame to frame and fake motion on a hand
-    that is actually still. Step speeds are smoothed over a short trailing
-    window since single-frame landmark jitter is comparable to real slow
-    motion. A row with no usable predecessor (first row, or a gap longer
-    than MAX_VELOCITY_GAP_SEC) gets `inf`, i.e. never counts as slow.
+    The wrist is used as the anchor rather than the closest-of-several contact
+    landmarks used for distance, because that "closest" landmark can flip between
+    fingertips frame to frame and fake motion on a hand that is actually still.
+    Step speeds are smoothed over a short trailing window since single-frame
+    landmark jitter is comparable to real slow motion. A row with no usable
+    predecessor (first row, or a gap longer than MAX_VELOCITY_GAP_SEC) gets `inf`,
+    i.e. never counts as slow.
     """
-    step_speeds = []
-    for i, row in enumerate(rows):
+
+    def __init__(self):
+        self._prev = None
+        self._steps = deque(maxlen=VELOCITY_SMOOTHING_ROWS)
+
+    def update(self, row) -> float:
         speed = float("inf")
-        if i > 0:
-            prev = rows[i - 1]
+        prev = self._prev
+        if prev is not None:
             dt = row["time_sec"] - prev["time_sec"]
             if 0 < dt <= MAX_VELOCITY_GAP_SEC:
                 px = _dist((row["wrist_x"], row["wrist_y"]), (prev["wrist_x"], prev["wrist_y"]))
                 speed = px / dt / row["head_scale_px"]
-        step_speeds.append(speed)
-        window = step_speeds[-VELOCITY_SMOOTHING_ROWS:]
-        row["velocity"] = sum(window) / len(window)
+        self._prev = row
+        self._steps.append(speed)
+        return sum(self._steps) / len(self._steps)
+
+
+def add_velocities(rows) -> None:
+    """Annotate time-sorted rows of ONE hand with a `velocity` key
+    (see VelocityTracker)."""
+    tracker = VelocityTracker()
+    for row in rows:
+        row["velocity"] = tracker.update(row)
+
+
+class HandTouchTracker:
+    """Frame-by-frame touch state machine for ONE hand label.
+
+    Feed rows in time order with update(); it returns messages as they become
+    known, so it works identically on a finished recording and on a live feed:
+
+      {"type": "start", ...}  a touch is confirmed (after `enter_frames` frames that
+                              pass the gate); start_time is back-dated to the first
+                              of those frames, detected_time is when it was confirmed
+      {"type": "end", "event": {...}}  the touch is over (after `exit_frames` frames
+                              that fail the gate); the event carries start_time,
+                              contact_time, end_time and min_normalized_distance
+
+    `contact_window_seconds` bounds how far past `start_time` we look for the
+    "contact" frame (the local minimum of the distance signal). This matters
+    because the hand can linger near the threshold for a long stretch (fidgeting,
+    resting near the face after a real touch) without the exit debounce firing,
+    which keeps a single event "open" for much longer than the actual touch lasted.
+    Searching the *whole* open stretch for a global minimum can then pick a later,
+    unrelated dip as "contact". Ground-truth touches in this project are
+    consistently under ~1.5s from start to end, so that's the default search
+    window; `end_time` (and the exit debounce that produces it) is unaffected and
+    can still extend well past it.
+
+    `velocity_threshold` (head-widths/sec, None = off) adds a second gate: a frame
+    only counts as "touching" if the hand is close AND not moving too fast. A hand
+    resting on the head is slow, while a gesture sweeping through the zone is fast.
+    Because the gate feeds the same enter/exit debounce, `enter_frames` doubles as
+    the dwell-time requirement.
+
+    Frames where the hand is not detected simply never reach update(), so a hand
+    briefly hidden mid-touch neither confirms nor ends a touch. On a recording that is
+    harmless (the next detection closes the touch), but on a live feed a hand that
+    leaves the frame would leave the touch open forever. `lost_timeout_seconds`
+    (None = off, the batch default) fixes that: call tick(now) every frame, and a touch
+    whose hand has not been seen for that long is closed at the last time it was seen.
+    """
+
+    def __init__(self, hand, threshold, enter_frames, exit_frames,
+                 contact_window_seconds=1.5, velocity_threshold=None, lost_timeout_seconds=None):
+        self.hand = hand
+        self.threshold = threshold
+        self.enter_frames = enter_frames
+        self.exit_frames = exit_frames
+        self.contact_window_seconds = contact_window_seconds
+        self.velocity_threshold = velocity_threshold
+        self.lost_timeout_seconds = lost_timeout_seconds
+        self._velocity = VelocityTracker() if velocity_threshold is not None else None
+        # Enough history to back-date the start (enter_frames rows) and the end
+        # (exit_frames + 1 rows) without keeping the whole stream.
+        self._history = deque(maxlen=max(enter_frames, exit_frames + 1))
+        self.state = "idle"
+        self._below = 0
+        self._above = 0
+        self._start_row = None
+        self._best_row = None  # min normalized_distance row within the contact window
+
+    @property
+    def touching(self) -> bool:
+        return self.state == "touching"
+
+    def _event(self, end_time):
+        best = self._best_row
+        return {
+            "hand": self.hand,
+            "start_time": self._start_row["time_sec"],
+            "contact_time": best["time_sec"],
+            "end_time": end_time,
+            "min_normalized_distance": best["normalized_distance"],
+        }
+
+    def update(self, row):
+        messages = []
+        if self._velocity is not None:
+            row["velocity"] = self._velocity.update(row)
+        self._history.append(row)
+
+        below = row["normalized_distance"] <= self.threshold
+        if self._velocity is not None:
+            below = below and row["velocity"] <= self.velocity_threshold
+
+        if self.state == "idle":
+            self._below = self._below + 1 if below else 0
+            if self._below >= self.enter_frames:
+                # Back-date the start to where the run of "below" frames began.
+                self._start_row = self._history[-self.enter_frames]
+                self._best_row = row
+                self.state = "touching"
+                self._above = 0
+                messages.append({"type": "start", "hand": self.hand,
+                                 "start_time": self._start_row["time_sec"],
+                                 "detected_time": row["time_sec"]})
+        else:  # touching
+            if (row["time_sec"] - self._start_row["time_sec"] <= self.contact_window_seconds
+                    and row["normalized_distance"] < self._best_row["normalized_distance"]):
+                self._best_row = row
+            self._above = self._above + 1 if not below else 0
+            if self._above >= self.exit_frames:
+                h = self._history
+                end_row = h[-(self.exit_frames + 1)] if len(h) > self.exit_frames else h[0]
+                # Back-dating the end by exit_frames can land before the contact
+                # frame on short events; an event can't end before it touches.
+                end_time = max(end_row["time_sec"], self._best_row["time_sec"])
+                messages.append({"type": "end", "event": self._event(end_time)})
+                self.state = "idle"
+                self._below = 0
+                self._start_row = None
+                self._best_row = None
+        return messages
+
+    def tick(self, now):
+        """Advance the clock on a frame where this hand was not seen. Closes an open
+        touch whose hand has been missing longer than `lost_timeout_seconds`."""
+        if (self.state != "touching" or self.lost_timeout_seconds is None
+                or now - self._history[-1]["time_sec"] <= self.lost_timeout_seconds):
+            return []
+        end_time = max(self._history[-1]["time_sec"], self._best_row["time_sec"])
+        event = self._event(end_time)
+        self.state = "idle"
+        self._below = 0
+        self._start_row = None
+        self._best_row = None
+        return [{"type": "end", "event": event, "reason": "hand lost"}]
+
+    def flush(self):
+        """Close a touch that is still open when the stream ends."""
+        if self.state != "touching":
+            return None
+        event = self._event(self._history[-1]["time_sec"])
+        self.state = "idle"
+        self._start_row = None
+        self._best_row = None
+        return event
+
+
+class TouchDetector:
+    """One HandTouchTracker per hand label, fed the rows of each frame."""
+
+    def __init__(self, threshold, enter_frames, exit_frames,
+                 contact_window_seconds=1.5, velocity_threshold=None, lost_timeout_seconds=None):
+        self._kwargs = dict(threshold=threshold, enter_frames=enter_frames, exit_frames=exit_frames,
+                            contact_window_seconds=contact_window_seconds,
+                            velocity_threshold=velocity_threshold,
+                            lost_timeout_seconds=lost_timeout_seconds)
+        self.trackers = {}
+
+    def update(self, rows):
+        messages = []
+        for row in rows:
+            tracker = self.trackers.get(row["hand"])
+            if tracker is None:
+                tracker = self.trackers[row["hand"]] = HandTouchTracker(row["hand"], **self._kwargs)
+            messages.extend(tracker.update(row))
+        return messages
+
+    def tick(self, now):
+        """Call once per frame after update(): closes touches whose hand has vanished."""
+        messages = []
+        for tracker in self.trackers.values():
+            messages.extend(tracker.tick(now))
+        return messages
+
+    @property
+    def touching_hands(self):
+        return [hand for hand, t in self.trackers.items() if t.touching]
+
+    def flush(self):
+        return [e for e in (t.flush() for t in self.trackers.values()) if e is not None]
 
 
 def extract_events(signal_rows, threshold: float, enter_frames: int, exit_frames: int,
                     contact_window_seconds: float = 1.5, velocity_threshold: float = None):
-    """State machine per hand label -> list of event dicts with keys
-    start_time, contact_time, end_time, hand (all in seconds), plus
-    min_normalized_distance for diagnostics.
-
-    `contact_window_seconds` bounds how far past `start_time` we look for
-    the "contact" frame (the local minimum of the distance signal). This
-    matters because the hand can linger near the threshold for a long
-    stretch (fidgeting, resting near the face after a real touch) without
-    the exit debounce firing, which keeps a single event "open" for much
-    longer than the actual touch lasted. Searching the *whole* open
-    stretch for a global minimum can then pick a later, unrelated dip as
-    "contact". Ground-truth touches in this project are consistently
-    under ~1.5s from start to end, so that's the default search window;
-    `end_time` (and the exit debounce that produces it) is unaffected and
-    can still extend well past it.
-
-    `velocity_threshold` (head-widths/sec, None = off) adds a second gate:
-    a frame only counts as "touching" if the hand is close AND slow. A real
-    touch decelerates to near-standstill at the head, while a gesture or
-    hair-flick passes through the close zone at speed. Because the gate
-    feeds the same enter/exit debounce, `enter_frames` doubles as the
-    dwell-time requirement.
-    """
-    by_hand = {}
+    """Batch entry point: run a whole recorded signal through the same
+    frame-by-frame TouchDetector that the live demo uses, and return the events
+    as a list of dicts with keys start_time, contact_time, end_time, hand (all in
+    seconds) plus min_normalized_distance for diagnostics. See HandTouchTracker for
+    the meaning of the parameters."""
+    detector = TouchDetector(threshold, enter_frames, exit_frames,
+                             contact_window_seconds, velocity_threshold)
+    # Keep events grouped by hand in first-seen order, then sort by start time, so
+    # ties between hands keep a stable, reproducible order.
+    events_by_hand = {}
     for row in signal_rows:
-        by_hand.setdefault(row["hand"], []).append(row)
+        events_by_hand.setdefault(row["hand"], [])
+    for row in sorted(signal_rows, key=lambda r: r["frame"]):
+        for msg in detector.update([row]):
+            if msg["type"] == "end":
+                events_by_hand[msg["event"]["hand"]].append(msg["event"])
+    for event in detector.flush():
+        events_by_hand[event["hand"]].append(event)
 
-    events = []
-    for hand_label, rows in by_hand.items():
-        rows.sort(key=lambda r: r["frame"])
-        if velocity_threshold is not None:
-            add_velocities(rows)
-        state = "idle"
-        consecutive_below = 0
-        consecutive_above = 0
-        start_row = None
-        best_row = None  # min normalized_distance row within the contact search window
-
-        for idx, row in enumerate(rows):
-            below = row["normalized_distance"] <= threshold
-            if velocity_threshold is not None:
-                below = below and row["velocity"] <= velocity_threshold
-
-            if state == "idle":
-                consecutive_below = consecutive_below + 1 if below else 0
-                if consecutive_below >= enter_frames:
-                    # Back-date the start to where the run of "below" frames began.
-                    start_idx = idx - enter_frames + 1
-                    start_row = rows[max(start_idx, 0)]
-                    best_row = row
-                    state = "touching"
-                    consecutive_above = 0
-            else:  # state == "touching"
-                if (row["time_sec"] - start_row["time_sec"] <= contact_window_seconds
-                        and row["normalized_distance"] < best_row["normalized_distance"]):
-                    best_row = row
-                consecutive_above = consecutive_above + 1 if not below else 0
-                if consecutive_above >= exit_frames:
-                    end_idx = idx - exit_frames
-                    end_row = rows[max(end_idx, 0)]
-                    events.append({
-                        "hand": hand_label,
-                        "start_time": start_row["time_sec"],
-                        "contact_time": best_row["time_sec"],
-                        # Back-dating the end by exit_frames can land before the
-                        # contact frame on short events; an event can't end before it touches.
-                        "end_time": max(end_row["time_sec"], best_row["time_sec"]),
-                        "min_normalized_distance": best_row["normalized_distance"],
-                    })
-                    state = "idle"
-                    consecutive_below = 0
-                    start_row = None
-                    best_row = None
-
-        if state == "touching":
-            # Video ended while still in contact; close the event at the last row.
-            events.append({
-                "hand": hand_label,
-                "start_time": start_row["time_sec"],
-                "contact_time": best_row["time_sec"],
-                "end_time": rows[-1]["time_sec"],
-                "min_normalized_distance": best_row["normalized_distance"],
-            })
-
+    events = [e for hand_events in events_by_hand.values() for e in hand_events]
     events.sort(key=lambda e: e["start_time"])
     return events
 

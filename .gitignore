@@ -3,4 +3,8 @@ __pycache__/
 *.pyc
 outputs/
 models/
-data
+data/
+# Never commit raw videos: the source recording is private and 345 MB.
+# The two annotated demo clips are the only exception.
+*.mp4
+!demo/*.mp4

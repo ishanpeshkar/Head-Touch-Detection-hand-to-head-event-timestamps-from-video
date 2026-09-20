@@ -32,7 +32,12 @@ Hand-movement-detection-proj/
 │   ├── evaluate.py           # Phase 4: match detected events to ground truth, report metrics
 │   ├── tune_threshold.py     # grid-search gate settings against a cached signal + ground truth
 │   ├── geometry_experiment.py# Pass 6: compare head shapes offline, incl. leave-one-out
-│   └── visualize_events.py   # draws the detector's view on each detected contact frame
+│   ├── visualize_events.py   # draws the detector's view on each detected contact frame
+│   ├── live_demo.py          # live webcam / stream mode: same pipeline, frame by frame
+│   └── reencode_h264.py      # dev helper: make a --record video browser-playable (H.264)
+├── tests/
+│   └── test_touch_logic.py   # event-logic tests: streaming == original batch logic, synthetic cases
+├── demo/                     # two short annotated clips run through the live pipeline
 ├── docs/
 │   └── how-it-works.md       # detailed walkthrough of the method, with example frames
 ├── results/                  # committed sample output: detected events, signal, annotated frames
@@ -236,6 +241,81 @@ shape never needs the (expensive) landmark extraction again:
     outputs\detected_events.csv --from-signal outputs\distance_signal.csv
 ```
 
+### Live mode (webcam)
+
+```powershell
+.venv\Scripts\python.exe src\live_demo.py                              # default webcam; q or Esc quits
+.venv\Scripts\python.exe src\live_demo.py --record outputs\demo.mp4    # also save the annotated feed
+# a video file works as a stand-in for a camera; --start / --duration pick an excerpt
+.venv\Scripts\python.exe src\live_demo.py --source data\test_video_task.mp4 --start 38 --duration 32 `
+    --no-window --record outputs\clip.mp4
+```
+
+It shows the head zone, the hand landmarks with each hand's distance and speed, a green
+**TOUCH** banner while a touch is confirmed, and a running log, and prints `TOUCH START` /
+`TOUCH END` lines as they happen.
+
+**Same code as the batch detector.** Per-frame analysis (`analyze_frame`) and the touch
+state machine (`TouchDetector`, one `HandTouchTracker` per hand) are shared; the batch
+`extract_events` is that same code run over a finished recording. `tests/` checks this
+(`python -m unittest discover -s tests`, 12 tests): the frame-by-frame detector gives
+exactly the same events as the original whole-recording implementation across 48
+combinations of settings on the real signal, and synthetic cases cover the behaviours that
+matter live — a fast sweep through the zone is ignored, a hand held still is one touch, a
+brief dip is ignored, a hand lost for a few frames mid-touch does not split the touch, and
+a touch still open when the stream stops is closed.
+
+**End-to-end check.** Streaming the whole recording (9,349 frames) through `live_demo.py` at
+native resolution gave exactly the same 6 events, with identical start, contact and end
+times, as the batch run. Touch alerts arrived 0.07 s (2 frames) after the touch began.
+
+**What to expect live, and what has not been validated**
+- **Latency.** A `TOUCH START` alert appears after `--enter-frames` (3) qualifying frames.
+  The end, and therefore the final contact time, is only known after `--exit-frames` (10)
+  frames that fail the gate.
+- **A hand that leaves the frame.** Frames where a hand is not detected do not end a touch
+  (so occlusion by the head does not split it). Live, that would leave a touch open forever
+  after the hand is lowered out of view, so `--lost-timeout` (default 1 s) closes a touch
+  whose hand has not been seen for that long, at the last time it was seen. The batch
+  path does not use this; it is off there.
+- **Throughput.** On the development CPU the two MediaPipe models take about 60 ms per
+  frame (hand 37 ms, pose 22 ms); the whole loop ran at 10 to 17 fps across runs. The
+  enter/exit counts are in *frames* and were chosen on a 30 fps recording, so at 10 fps
+  they span 3x more real time (about 0.3 s to confirm a touch, 1 s to end one). Speed is computed from real
+  elapsed time, so the speed gate does not depend on frame rate, but the debounce does.
+  `live_demo.py` prints a warning when it runs below 20 fps.
+- **Resizing.** Frames are resized to 640 px wide by default for speed; landmarks shift
+  slightly, so events differ a little from the native-resolution batch run (first touch:
+  batch start 00:41.90 / contact 00:41.97, live at 640 px start 00:41.87 / contact 00:42.27).
+- **Run on a webcam, but accuracy not measured live.** The author ran it on a laptop
+  webcam and it worked (overlay and touch alerts behaved as expected), but that was an
+  informal check. All accuracy numbers in this README come from one recorded video;
+  other cameras, framing, lighting, mirrored views (which change MediaPipe's left/right
+  labels) and low frame rates have not been measured.
+
+### Demo videos
+
+Two short excerpts of the test recording, run through the live pipeline
+(`src/live_demo.py`) and saved with its overlay: the cyan circle is the head zone, the dots
+are the hand landmarks, the banner turns green while a touch is confirmed, and the log lists
+the start/end alerts. `t =` is the time in the original recording.
+
+| Clip | Shows |
+|---|---|
+| [demo_1_two_touches_and_a_false_alarm.mp4](demo/demo_1_two_touches_and_a_false_alarm.mp4) (00:38–01:10) | Touch 1 (00:41.9) and touch 2 (01:04.6) detected, plus a **false alarm at 00:57.5** where both hands are clasped in front of the face. |
+| [demo_2_three_touches_incl_quick_tap.mp4](demo/demo_2_three_touches_incl_quick_tap.mp4) (02:24–03:22) | Touches 3 (02:27.5), 4 (02:34.9) and the quick tap at 03:18.2 detected; open hands raised around 03:14 are correctly ignored. |
+
+These are **a recording streamed through the live code, not a live camera**, processed at
+640 px wide, so times differ slightly from the native-resolution results below. The excerpts
+were **chosen** to show successes and a known failure, not sampled at random. To regenerate:
+
+```powershell
+.venv\Scripts\python.exe src\live_demo.py --source data\test_video_task.mp4 --start 38 --duration 32 `
+    --no-window --record outputs\demo_raw_1.mp4
+pip install imageio-ffmpeg    # dev-only, for the H.264 re-encode
+.venv\Scripts\python.exe src\reencode_h264.py outputs\demo_raw_1.mp4 demo\demo_1.mp4
+```
+
 ### Results
 
 Run against `data/test_video_task.mp4` (5:12, 9,349 frames).
@@ -380,6 +460,9 @@ head-widths/sec for 3+ consecutive frames. Timing error: **0.03 s**.
   annotations on every matched touch for this video, so no mirroring correction was needed;
   this may not hold for other cameras (e.g. mirrored webcams). Matching therefore ignores
   the label and reports it as a diagnostic.
+- **Live accuracy is unmeasured.** Live mode was checked by streaming a recording through
+  the live loop (identical events to the batch run) and informally on a laptop webcam, but
+  no accuracy was measured on a live feed (see Live mode).
 - **Toward production.** Validate on multiple people/cameras/lighting first. If precision
   is still inadequate, train a small classifier over the *existing* features (distance,
   speed, dwell time) rather than end-to-end video models; both need labeled footage
@@ -387,8 +470,9 @@ head-widths/sec for 3+ consecutive frames. Timing error: **0.03 s**.
 
 ## Reproducing
 
-The source video is a personal recording and is **not shared** (it is also 345 MB, over
-GitHub's 100 MB file limit), and the model bundles are not in the repo. The committed
+The source video is a personal recording and is **not in the repo** (it is 345 MB, over
+GitHub's 100 MB file limit; it can be shared separately on request), and the model
+bundles are not in the repo either. The committed
 `results/` folder holds the detected events, the per-frame signal (with the raw geometry)
 and annotated frames from the run reported here, and `annotations/` holds the ground truth,
 so the evaluation, gate tuning and the Pass 6 head-shape experiment can all be re-run

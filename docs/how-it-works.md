@@ -88,6 +88,31 @@ The drawing shows the head zone (cyan; its edge is distance 1.0), the head keypo
 (white), the wrist (yellow) and fingertips (green) of each hand, and the closest hand
 landmark joined to the zone's centre (red).
 
+## Live mode
+
+`src/live_demo.py` runs the same four stages on a webcam feed, one frame at a time. Nothing
+in the logic is live-specific: `analyze_frame` turns one frame's landmarks into rows, and
+`TouchDetector` (one `HandTouchTracker` per hand) consumes them and reports messages as
+they become known: `start` once a touch is confirmed, `end` (with the final start, contact
+and end times) once it is over. The batch path, `extract_events`, is that same detector run
+over a recorded signal, so the two cannot drift apart; `tests/test_touch_logic.py` checks
+that they give identical events against the original whole-recording implementation.
+
+The history the tracker keeps is only a few rows, enough to back-date a start or an end, so
+memory does not grow with the stream. Live differs from offline in timing, not in logic:
+an alert lags the real touch by `enter_frames` frames, the contact time is only final at
+the end, and the frame-count settings span more real time when the machine processes only
+10 to 17 frames per second (the models take ~60 ms per frame on the development CPU).
+
+One live-only addition: frames where a hand is not detected do not end a touch (occlusion
+by the head would otherwise split it), which on a live feed would leave a touch open after
+the hand leaves the frame. `--lost-timeout` (1 s by default) closes such a touch at the
+last time the hand was seen; it is off in the batch path, so batch results are unchanged.
+
+Two short annotated clips produced by this path are in [demo/](../demo/) (a recording
+streamed through the live code, not a live camera). Streaming the full recording through
+`live_demo.py` at native resolution gave exactly the same 6 events as the batch run.
+
 ## Evaluation
 
 - **`evaluate.py`** matches detected events to annotated events one-to-one by nearest
@@ -191,6 +216,9 @@ contacts with the chin and the eye, which the ground truth does not count.
 | `src/head_touch_detector.py` | The core: landmarks, head zone, speed, event extraction |
 | `src/evaluate.py`, `src/tune_threshold.py`, `src/geometry_experiment.py` | Scoring, gate tuning, head-shape comparison |
 | `src/visualize_events.py` | Draws the detector's view on each detected contact frame |
+| `src/live_demo.py` | Live webcam / stream mode with overlay, alerts and optional recording |
+| `src/reencode_h264.py` | Dev helper: re-encode a `--record` video to browser-playable H.264 |
+| `tests/test_touch_logic.py` | Event-logic tests, incl. streaming vs. the original batch implementation |
 | `src/timeutils.py`, `src/download_models.py` | Shared time helpers; model download |
 
 ## Design rationale and caveats
@@ -212,6 +240,9 @@ contacts with the chin and the eye, which the ground truth does not count.
 - **The zone only covers the top of the head**, so face contacts below the eyes are not
   detected, which is consistent with the ground truth but would need revisiting if the
   target changes.
+- **Live accuracy is unmeasured.** Live mode was checked on a recording streamed through
+  the live loop (identical events to the batch run) and informally on a laptop webcam, but
+  no accuracy was measured on a live feed.
 - **Rule-based, not trained.** The natural next step is a small classifier over the
   existing features (distance, speed, dwell time), but only once footage from several
   people and cameras is available.
