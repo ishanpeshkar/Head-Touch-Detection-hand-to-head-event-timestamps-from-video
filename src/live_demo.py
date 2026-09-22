@@ -34,6 +34,8 @@ from collections import deque
 import cv2
 import mediapipe as mp
 
+from behavior_events import DEFAULT_MIN_COUNT, DEFAULT_WINDOW_SECONDS, LiveRepetitionAggregator
+from clip_writer import LiveClipWriter, write_behavior_events_csv
 from head_touch_detector import (
     HAND_CONTACT_LANDMARK_IDS, TouchDetector, analyze_frame, apply_head_geometry,
     create_landmarkers, write_events_csv,
@@ -121,16 +123,34 @@ def main():
                          "(a hand leaving the frame would otherwise leave the touch open forever)")
     ap.add_argument("--head-up", type=float, default=0.6)
     ap.add_argument("--head-radius", type=float, default=0.6)
+    ap.add_argument("--bang-window", type=float, default=DEFAULT_WINDOW_SECONDS,
+                    help="Max gap (seconds) between consecutive touches to still count as the same "
+                         "bout, for head-banging detection")
+    ap.add_argument("--bang-count", type=int, default=DEFAULT_MIN_COUNT,
+                    help="Touches required within --bang-window to call a bout head-banging instead "
+                         "of separate touches")
+    ap.add_argument("--clip-dir", default=None,
+                    help="Save one video clip per detected behavior event (touch or head-banging) "
+                         "into this directory")
+    ap.add_argument("--clip-preroll", type=float, default=1.0,
+                    help="Seconds of buffered footage to include before a clip's event starts")
+    ap.add_argument("--behavior-csv", default=None,
+                    help="Write one row per detected behavior event here on exit, with a clip_path "
+                         "column if --clip-dir is also given")
     args = ap.parse_args()
 
     cap, is_live = open_source(args.source)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    out_fps = args.record_fps if is_live else src_fps
     hand_lm, pose_lm = create_landmarkers()
     detector = TouchDetector(args.threshold, args.enter_frames, args.exit_frames,
                              args.contact_window, args.velocity_threshold,
                              lost_timeout_seconds=args.lost_timeout)
+    aggregator = LiveRepetitionAggregator(window_seconds=args.bang_window, min_count=args.bang_count)
+    clip_writer = LiveClipWriter(args.clip_dir, preroll_seconds=args.clip_preroll, fps=out_fps) \
+        if args.clip_dir else None
 
-    events, log, touch_count = [], deque(maxlen=5), 0
+    events, behaviors, log, touch_count, clip_index = [], [], deque(maxlen=5), 0, 0
     start_frame = int(args.start * src_fps) if (args.start and not is_live) else 0
     if start_frame:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -173,11 +193,14 @@ def main():
                 else:
                     e = msg["event"]
                     events.append(e)
+                    aggregator.add(e)
                     line = f"{format_timestamp(e['end_time'])} touch end ({e['hand'].lower()})"
                     why = "  (hand left the frame)" if msg.get("reason") == "hand lost" else ""
                     print(f"TOUCH END    {e['hand'].lower():5s} hand  start={format_timestamp(e['start_time'])}"
                           f"  contact={format_timestamp(e['contact_time'])}  end={format_timestamp(e['end_time'])}{why}")
                 log.append(line)
+
+            finished_behaviors = aggregator.tick(now)
 
             proc_ms = (time.perf_counter() - loop_start) * 1000
             proc_ms_total += proc_ms
@@ -186,6 +209,17 @@ def main():
 
             draw_overlay(frame, head, rows, args.head_up, args.head_radius,
                          detector.touching_hands, touch_count, log, fps_ema, now)
+
+            if clip_writer:
+                clip_writer.step(frame, now, aggregator.active)
+            for fb in finished_behaviors:
+                clip_index += 1
+                saved = clip_writer.save(fb, clip_index) if clip_writer else {**fb, "clip_path": ""}
+                behaviors.append(saved)
+                tap_note = f" ({saved['tap_count']} taps)" if saved["behavior"] != "head_touch" else ""
+                clip_note = f"  clip={saved['clip_path']}" if saved.get("clip_path") else ""
+                print(f"BEHAVIOR     {saved['behavior']}{tap_note}  start={format_timestamp(saved['start_time'])}"
+                      f"  end={format_timestamp(saved['end_time'])}{clip_note}")
 
             if args.record:
                 if writer is None:
@@ -213,9 +247,19 @@ def main():
 
     for e in detector.flush():  # a touch still open when the stream stopped
         events.append(e)
+        aggregator.add(e)
         print(f"TOUCH END    {e['hand'].lower():5s} hand  (stream ended)  start={format_timestamp(e['start_time'])}"
               f"  contact={format_timestamp(e['contact_time'])}")
     events.sort(key=lambda e: e["start_time"])
+
+    for fb in aggregator.flush():  # a behavior still open when the stream stopped
+        clip_index += 1
+        saved = clip_writer.save(fb, clip_index) if clip_writer else {**fb, "clip_path": ""}
+        behaviors.append(saved)
+        tap_note = f" ({saved['tap_count']} taps)" if saved["behavior"] != "head_touch" else ""
+        clip_note = f"  clip={saved['clip_path']}" if saved.get("clip_path") else ""
+        print(f"BEHAVIOR     {saved['behavior']}{tap_note}  (stream ended)  start={format_timestamp(saved['start_time'])}"
+              f"  end={format_timestamp(saved['end_time'])}{clip_note}")
 
     frames_done = frame_idx - start_frame
     mean_ms = proc_ms_total / frames_done if frames_done else 0.0
@@ -228,8 +272,13 @@ def main():
     if args.events_csv:
         write_events_csv(args.events_csv, events)
         print(f"Events written to {args.events_csv}")
+    if args.behavior_csv:
+        write_behavior_events_csv(args.behavior_csv, behaviors)
+        print(f"Behavior events written to {args.behavior_csv}")
     if args.record:
         print(f"Annotated feed saved to {args.record}")
+    if args.clip_dir:
+        print(f"{len(behaviors)} clip(s) saved to {args.clip_dir}")
 
 
 if __name__ == "__main__":

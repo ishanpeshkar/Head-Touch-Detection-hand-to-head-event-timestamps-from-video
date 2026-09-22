@@ -34,9 +34,12 @@ Hand-movement-detection-proj/
 │   ├── geometry_experiment.py# Pass 6: compare head shapes offline, incl. leave-one-out
 │   ├── visualize_events.py   # draws the detector's view on each detected contact frame
 │   ├── live_demo.py          # live webcam / stream mode: same pipeline, frame by frame
+│   ├── behavior_events.py    # groups repeated touches into a head_banging behavior event
+│   ├── clip_writer.py        # cuts + saves a video clip per detected behavior event
 │   └── reencode_h264.py      # dev helper: make a --record video browser-playable (H.264)
 ├── tests/
-│   └── test_touch_logic.py   # event-logic tests: streaming == original batch logic, synthetic cases
+│   ├── test_touch_logic.py   # event-logic tests: streaming == original batch logic, synthetic cases
+│   └── test_behavior_events.py # head_touch vs. head_banging clustering, batch and streaming
 ├── demo/                     # two short annotated clips run through the live pipeline
 ├── docs/
 │   └── how-it-works.md       # detailed walkthrough of the method, with example frames
@@ -292,6 +295,49 @@ times, as the batch run. Touch alerts arrived 0.07 s (2 frames) after the touch 
   informal check. All accuracy numbers in this README come from one recorded video;
   other cameras, framing, lighting, mirrored views (which change MediaPipe's left/right
   labels) and low frame rates have not been measured.
+
+### Behavior clips (auto-clip on detection, incl. head banging)
+
+Two additions on top of the touch detector, for a downstream use case (an autism-behavior
+monitoring POC): grouping repeated touches into a "head banging" behavior, and cutting a
+saved clip for every detected behavior event instead of only printing/logging it.
+
+- **`src/behavior_events.py`** groups raw touch events into behavior events. An isolated
+  touch stays `head_touch`; several touches close together in time (`--bang-window`
+  seconds apart, `--bang-count` or more of them) become one `head_banging` event spanning
+  the whole bout. Clustering chains by *gap between consecutive touches*, not a fixed
+  window, so a bout can run arbitrarily long as long as no gap inside it exceeds
+  `--bang-window`. Batch (`cluster_repetitions`) and live (`LiveRepetitionAggregator`)
+  share this logic; `tests/test_behavior_events.py` covers both. **These thresholds are
+  intuition, not tuned against real head-banging footage** (none was available yet) — the
+  same caveat this README already makes about the touch detector's own settings.
+- **`src/clip_writer.py`** cuts one `.mp4` per behavior event (`export_clips` for a
+  finished file, `LiveClipWriter` for a live/streamed source) plus a metadata CSV
+  (`--behavior-csv`): event id, behavior, times, hand, tap count, and the clip's path.
+
+```powershell
+# batch: detect, then cut a clip per behavior event (reuses a cached signal if you have one)
+.venv\Scripts\python.exe src\head_touch_detector.py data\test_video_task.mp4 outputs\events.csv `
+    --from-signal outputs\distance_signal.csv --clip-dir outputs\clips --behavior-csv outputs\behaviors.csv
+
+# live: same, streamed frame by frame (works on a webcam or, as here, a file standing in for one)
+.venv\Scripts\python.exe src\live_demo.py --source data\test_video_task.mp4 --start 38 --duration 32 `
+    --no-window --clip-dir outputs\clips --behavior-csv outputs\behaviors.csv
+```
+
+**Known trade-off, live only:** a cluster can only be closed once the stream has gone
+quiet for `--bang-window` seconds — there's no way to know a bout is over any sooner than
+that. That means *every* behavior event, even a single isolated touch, is only finalized
+(and its clip only saved) after that same quiet gap, adding up to `--bang-window` seconds
+of latency and trailing footage to every clip. Lower `--bang-window` to trim that if it
+matters more than the bang-detection tolerance it also controls. The batch path doesn't
+have this problem — clips there are cut directly from the finished file with a small,
+fixed `--clip-preroll` / `--clip-postroll` instead.
+
+**Not yet built:** the other two behaviors from the same follow-up ask (ear covering, hair
+twirling) need a different detector than "hand near a circle" — they're closer to a
+learned motion pattern than a fixed geometric zone — plus the person-lock face
+recognition piece. Both still need example footage to build against.
 
 ### Demo videos
 

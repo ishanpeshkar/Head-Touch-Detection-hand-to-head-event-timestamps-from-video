@@ -61,6 +61,8 @@ import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
+from behavior_events import DEFAULT_MIN_COUNT, DEFAULT_WINDOW_SECONDS, cluster_repetitions
+from clip_writer import export_clips, write_behavior_events_csv
 from timeutils import format_timestamp
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -559,6 +561,21 @@ def main():
     parser.add_argument("--head-radius", type=float, default=0.6,
                          help="Head circle radius in head-widths (1.0 = original model)")
     parser.add_argument("--max-hands", type=int, default=2)
+    parser.add_argument("--bang-window", type=float, default=DEFAULT_WINDOW_SECONDS,
+                         help="Max gap (seconds) between consecutive touches to still count as the "
+                              "same bout, for head-banging detection")
+    parser.add_argument("--bang-count", type=int, default=DEFAULT_MIN_COUNT,
+                         help="Touches required within --bang-window to call a bout head-banging "
+                              "instead of separate touches")
+    parser.add_argument("--behavior-csv", default=None,
+                         help="Write one row per detected behavior event (touch or head-banging) here, "
+                              "with a clip_path column if --clip-dir is also given")
+    parser.add_argument("--clip-dir", default=None,
+                         help="Cut and save one video clip per detected behavior event into this directory")
+    parser.add_argument("--clip-preroll", type=float, default=1.0,
+                         help="Seconds of footage to include before a clip's event starts")
+    parser.add_argument("--clip-postroll", type=float, default=1.0,
+                         help="Seconds of footage to include after a clip's event ends")
     args = parser.parse_args()
 
     if args.from_signal:
@@ -591,6 +608,22 @@ def main():
         print(f"  {e['hand']:5s}  start={format_timestamp(e['start_time'])}  "
               f"contact={format_timestamp(e['contact_time'])}  end={format_timestamp(e['end_time'])}  "
               f"min_dist={e['min_normalized_distance']:.3f}")
+
+    # Group touches into behaviors (a burst of touches -> head_banging; see behavior_events.py)
+    # and optionally cut a clip per behavior event.
+    behaviors = cluster_repetitions(events, window_seconds=args.bang_window, min_count=args.bang_count)
+    if args.clip_dir:
+        behaviors = export_clips(args.video, behaviors, args.clip_dir,
+                                  preroll=args.clip_preroll, postroll=args.clip_postroll)
+        print(f"Exported {len(behaviors)} clip(s) to {args.clip_dir}")
+    if args.behavior_csv:
+        write_behavior_events_csv(args.behavior_csv, behaviors)
+        print(f"Behavior events written to {args.behavior_csv}")
+    if args.clip_dir or args.behavior_csv:
+        for b in behaviors:
+            tap_note = f"  taps={b['tap_count']}" if b["behavior"] != "head_touch" else ""
+            print(f"  {b['behavior']:12s} {b['hand']:5s}  start={format_timestamp(b['start_time'])}  "
+                  f"end={format_timestamp(b['end_time'])}{tap_note}")
 
 
 if __name__ == "__main__":
