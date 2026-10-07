@@ -1,0 +1,10 @@
+event_id,start_time,end_time,person,behavior,hand,notes
+1,00:36.0,00:40.0,subject,ear_cover,both,"user-confirmed"
+2,00:43.0,00:46.0,subject,ear_cover,right,"user-confirmed"
+3,00:47.0,00:53.0,subject,ear_cover,left,"user-confirmed"
+4,00:57.0,01:00.0,subject,hair_twirl,both,"head touch + twirling hair from above (short hair, barely visible)"
+5,01:05.0,01:09.0,subject,head_bang,right,"user-confirmed"
+6,01:09.0,01:10.0,subject,head_bang,left,"user-confirmed"
+7,01:10.0,01:16.0,subject,head_bang,both,"user-confirmed"
+8,01:36.0,01:38.0,subject,head_touch,,"short touch while second person is in frame"
+9,02:21.0,02:24.0,subject,head_bang,both,"user-confirmed"
